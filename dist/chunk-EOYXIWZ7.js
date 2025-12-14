@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "0.1.31";
+var version2 = "1.0.0";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20021,11 +20021,63 @@ import path2 from "path";
 import { EnvHttpProxyAgent, fetch as fetch2, Headers as Headers2, setGlobalDispatcher } from "undici";
 var REASON_AUTH_NEEDED = "authentication-needed";
 var REASON_TRANSPORT_FALLBACK = "falling-back-to-alternate-transport";
+var PING_INTERVAL_MS = 1e3;
+var PING_TIMEOUT_MS = 2e3;
+var MAX_PING_FAILURES = 3;
+var MAX_SSE_ERRORS_BEFORE_RECONNECT = 2;
+var SSE_ERROR_PATTERNS = ["timeout", "terminated", "aborted", "network", "ECONNRESET", "ECONNREFUSED"];
+async function pingServer(serverUrl) {
+  try {
+    const url2 = new URL(serverUrl);
+    const pingUrl = `${url2.protocol}//${url2.host}/ping`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
+    try {
+      const response = await fetch2(pingUrl, {
+        signal: controller.signal,
+        method: "GET"
+      });
+      clearTimeout(timeout);
+      return response.ok;
+    } catch (e) {
+      clearTimeout(timeout);
+      return false;
+    }
+  } catch (e) {
+    return false;
+  }
+}
 var pid = process.pid;
 var DEBUG = false;
+var LOG_FILE_PATH = "/tmp/mcp-remote.log";
+var CLEAR_LOG_ON_START = process.env.MCP_REMOTE_CLEAR_LOG !== "false";
+var logFileInitialized = false;
 function getTimestamp() {
   const now = /* @__PURE__ */ new Date();
   return now.toISOString();
+}
+function initLogFile() {
+  if (logFileInitialized) return;
+  logFileInitialized = true;
+  try {
+    if (CLEAR_LOG_ON_START) {
+      fs2.writeFileSync(LOG_FILE_PATH, `=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===
+`, { encoding: "utf8" });
+    } else {
+      fs2.appendFileSync(LOG_FILE_PATH, `
+=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===
+`, { encoding: "utf8" });
+    }
+  } catch (error2) {
+    console.error(`[LOG FILE ERROR] Could not initialize ${LOG_FILE_PATH}: ${error2}`);
+  }
+}
+function writeToLogFile(message) {
+  initLogFile();
+  try {
+    fs2.appendFileSync(LOG_FILE_PATH, message + "\n", { encoding: "utf8" });
+  } catch (error2) {
+  }
 }
 function debugLog(message, ...args) {
   if (!DEBUG) return;
@@ -20049,6 +20101,8 @@ function debugLog(message, ...args) {
 }
 function log(str, ...rest) {
   console.error(`[${pid}] ${str}`, ...rest);
+  const formattedMessage = `[${getTimestamp()}][${pid}] ${str} ${rest.map((arg) => typeof arg === "object" ? JSON.stringify(arg) : String(arg)).join(" ")}`;
+  writeToLogFile(formattedMessage);
   debugLog(str, ...rest);
 }
 var MESSAGE_BLOCKED = /* @__PURE__ */ Symbol("MessageBlocked");
@@ -20081,7 +20135,8 @@ function mcpProxy({
   transportToServer,
   ignoredTools = [],
   reconnectFn,
-  reconnectOptions = { enabled: false, maxAttempts: 5, baseDelayMs: 1e3 }
+  reconnectOptions = { enabled: false, maxAttempts: 5, baseDelayMs: 1e3 },
+  serverUrl
 }) {
   let transportToClientClosed = false;
   let transportToServerClosed = false;
@@ -20097,6 +20152,7 @@ function mcpProxy({
   const requestTimeoutMs = 5e3;
   const maxConsecutiveTimeouts = 3;
   let consecutiveTimeouts = 0;
+  let consecutiveSseErrors = 0;
   const pendingRequests = /* @__PURE__ */ new Map();
   let savedInitializeMessage = null;
   let initializeIdCounter = 1e6;
@@ -20217,38 +20273,69 @@ function mcpProxy({
   }
   function trackRequest(message) {
     if (!message.id) return;
-    const timeout = setTimeout(() => {
-      log(`[Timeout] Request ${message.id} (${message.method}) timed out after ${requestTimeoutMs}ms`);
-      const pending = pendingRequests.get(message.id);
-      pendingRequests.delete(message.id);
-      consecutiveTimeouts++;
-      log(`[Timeout] Consecutive timeouts: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}`);
-      if (connectionHealthy && !isReconnecting) {
-        log("[Timeout] Marking connection as unhealthy and triggering reconnection...");
-        connectionHealthy = false;
-        if (pending) {
-          log(`[Timeout] Queuing request ${message.id} for retry after reconnection...`);
-          queueMessageForRetry(pending.message);
+    if (!serverUrl) {
+      const timeout = setTimeout(() => {
+        log(`[Timeout] Request ${message.id} (${message.method}) timed out after ${requestTimeoutMs}ms (no ping URL)`);
+        handleRequestTimeout(message.id);
+      }, requestTimeoutMs);
+      pendingRequests.set(message.id, { timeout, message });
+      return;
+    }
+    let pingFailures = 0;
+    const pingInterval = setInterval(async () => {
+      if (isReconnecting || !connectionHealthy) {
+        return;
+      }
+      debugLog(`[Ping] Checking server health for request ${message.id}...`);
+      const isAlive = await pingServer(serverUrl);
+      if (isAlive) {
+        if (pingFailures > 0) {
+          debugLog(`[Ping] Server recovered, resetting failure counter (was ${pingFailures})`);
+          pingFailures = 0;
         }
-        currentTransportToServer.close().catch(onServerError);
-      } else if (isReconnecting) {
-        if (pending) {
-          log(`[Timeout] Already reconnecting, queuing request ${message.id} for retry...`);
-          queueMessageForRetry(pending.message);
-        }
+        debugLog(`[Ping] Server alive, continuing to wait for request ${message.id}`);
       } else {
-        if (pending) {
-          log(`[Timeout] Connection unhealthy, queuing request ${message.id} for retry...`);
-          queueMessageForRetry(pending.message);
+        pingFailures++;
+        log(`[Ping] Server ping failed for request ${message.id} (${pingFailures}/${MAX_PING_FAILURES})`);
+        if (pingFailures >= MAX_PING_FAILURES) {
+          log(`[Ping] Max ping failures reached, marking connection as dead`);
+          clearInterval(pingInterval);
+          handleRequestTimeout(message.id);
         }
       }
-    }, requestTimeoutMs);
-    pendingRequests.set(message.id, { timeout, message });
+    }, PING_INTERVAL_MS);
+    pendingRequests.set(message.id, { timeout: pingInterval, message });
+  }
+  function handleRequestTimeout(messageId) {
+    const pending = pendingRequests.get(messageId);
+    pendingRequests.delete(messageId);
+    consecutiveTimeouts++;
+    log(`[Timeout] Consecutive timeouts: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}`);
+    if (connectionHealthy && !isReconnecting) {
+      log("[Timeout] Marking connection as unhealthy and triggering reconnection...");
+      connectionHealthy = false;
+      if (pending) {
+        log(`[Timeout] Queuing request ${pending.message.id} for retry after reconnection...`);
+        queueMessageForRetry(pending.message);
+      }
+      currentTransportToServer.close().catch(onServerError);
+    } else if (isReconnecting) {
+      if (pending) {
+        log(`[Timeout] Already reconnecting, queuing request ${pending.message.id} for retry...`);
+        queueMessageForRetry(pending.message);
+      }
+    } else {
+      if (pending) {
+        log(`[Timeout] Connection unhealthy, queuing request ${pending.message.id} for retry...`);
+        queueMessageForRetry(pending.message);
+      }
+    }
   }
   function clearRequestTracking(messageId) {
     const pending = pendingRequests.get(messageId);
     if (pending) {
       clearTimeout(pending.timeout);
+      clearInterval(pending.timeout);
       pendingRequests.delete(messageId);
       if (consecutiveTimeouts > 0) {
         log(`[Recovery] Response received, resetting consecutive timeout counter (was ${consecutiveTimeouts})`);
@@ -20259,6 +20346,7 @@ function mcpProxy({
   function clearAllRequestTracking() {
     for (const [id, pending] of pendingRequests) {
       clearTimeout(pending.timeout);
+      clearInterval(pending.timeout);
     }
     pendingRequests.clear();
   }
@@ -20348,6 +20436,7 @@ function mcpProxy({
             isReconnecting = false;
             connectionHealthy = true;
             consecutiveTimeouts = 0;
+            consecutiveSseErrors = 0;
             log(`Flushing ${pendingMessages.length} queued messages...`);
             while (pendingMessages.length > 0) {
               const pending = pendingMessages.shift();
@@ -20440,6 +20529,20 @@ function mcpProxy({
   function onServerError(error2) {
     log("Error from remote server:", error2);
     debugLog("Error from remote server", { stack: error2.stack });
+    const errorStr = String(error2).toLowerCase();
+    const isConnectionError = SSE_ERROR_PATTERNS.some((pattern) => errorStr.includes(pattern.toLowerCase()));
+    if (isConnectionError) {
+      consecutiveSseErrors++;
+      log(`[SSE Error] Connection error detected (${consecutiveSseErrors}/${MAX_SSE_ERRORS_BEFORE_RECONNECT}): ${errorStr.substring(0, 100)}`);
+      if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
+        log("[SSE Error] Max consecutive SSE errors reached, forcing reconnection...");
+        consecutiveSseErrors = 0;
+        connectionHealthy = false;
+        currentTransportToServer.close().catch((e) => {
+          log("[SSE Error] Error closing transport:", e);
+        });
+      }
+    }
   }
 }
 async function connectToRemoteServer(client, serverUrl, authProvider, headers, authInitializer, transportStrategy = "http-first", recursionReasons = /* @__PURE__ */ new Set()) {

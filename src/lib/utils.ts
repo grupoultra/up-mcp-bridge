@@ -25,6 +25,44 @@ declare global {
 export const REASON_AUTH_NEEDED = 'authentication-needed'
 export const REASON_TRANSPORT_FALLBACK = 'falling-back-to-alternate-transport'
 
+// Ping configuration
+const PING_INTERVAL_MS = 1000 // Ping every 1 second while waiting for response
+const PING_TIMEOUT_MS = 2000 // Ping request timeout
+const MAX_PING_FAILURES = 3 // Number of consecutive ping failures before marking connection dead
+
+// SSE error detection for reconnection
+const MAX_SSE_ERRORS_BEFORE_RECONNECT = 2 // Number of consecutive SSE errors before forcing reconnect
+const SSE_ERROR_PATTERNS = ['timeout', 'terminated', 'aborted', 'network', 'ECONNRESET', 'ECONNREFUSED']
+
+/**
+ * Pings the server to check if it's alive.
+ * @param serverUrl The server URL (will derive /ping endpoint from it)
+ * @returns true if server responds, false otherwise
+ */
+async function pingServer(serverUrl: string): Promise<boolean> {
+  try {
+    const url = new URL(serverUrl)
+    const pingUrl = `${url.protocol}//${url.host}/ping`
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS)
+
+    try {
+      const response = await fetch(pingUrl, {
+        signal: controller.signal,
+        method: 'GET',
+      })
+      clearTimeout(timeout)
+      return response.ok
+    } catch (e) {
+      clearTimeout(timeout)
+      return false
+    }
+  } catch (e) {
+    return false
+  }
+}
+
 // Transport strategy types
 export type TransportStrategy = 'sse-only' | 'http-only' | 'sse-first' | 'http-first'
 
@@ -43,10 +81,41 @@ const pid = process.pid
 // Global debug flag
 export let DEBUG = false
 
+// File logging configuration
+const LOG_FILE_PATH = '/tmp/mcp-remote.log'
+const CLEAR_LOG_ON_START = process.env.MCP_REMOTE_CLEAR_LOG !== 'false' // Default: clear on start
+let logFileInitialized = false
+
 // Helper function for timestamp formatting
 function getTimestamp(): string {
   const now = new Date()
   return now.toISOString()
+}
+
+// Initialize log file (clear if configured)
+function initLogFile() {
+  if (logFileInitialized) return
+  logFileInitialized = true
+
+  try {
+    if (CLEAR_LOG_ON_START) {
+      fs.writeFileSync(LOG_FILE_PATH, `=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
+    } else {
+      fs.appendFileSync(LOG_FILE_PATH, `\n=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
+    }
+  } catch (error) {
+    console.error(`[LOG FILE ERROR] Could not initialize ${LOG_FILE_PATH}: ${error}`)
+  }
+}
+
+// Write to log file (always, regardless of DEBUG flag)
+function writeToLogFile(message: string) {
+  initLogFile()
+  try {
+    fs.appendFileSync(LOG_FILE_PATH, message + '\n', { encoding: 'utf8' })
+  } catch (error) {
+    // Silently ignore file write errors
+  }
 }
 
 // Debug logging function
@@ -85,7 +154,11 @@ export function log(str: string, ...rest: unknown[]) {
   // Using stderr so that it doesn't interfere with stdout
   console.error(`[${pid}] ${str}`, ...rest)
 
-  // If debug mode is on, also log to debug file
+  // Always write to log file
+  const formattedMessage = `[${getTimestamp()}][${pid}] ${str} ${rest.map((arg) => (typeof arg === 'object' ? JSON.stringify(arg) : String(arg))).join(' ')}`
+  writeToLogFile(formattedMessage)
+
+  // If debug mode is on, also log to debug file (legacy)
   debugLog(str, ...rest)
 }
 
@@ -133,12 +206,14 @@ export function mcpProxy({
   ignoredTools = [],
   reconnectFn,
   reconnectOptions = { enabled: false, maxAttempts: 5, baseDelayMs: 1000 },
+  serverUrl,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
   reconnectFn?: ReconnectFunction
   reconnectOptions?: ReconnectOptions
+  serverUrl?: string
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
@@ -154,6 +229,7 @@ export function mcpProxy({
   const requestTimeoutMs = 5000 // If no response in 5s, assume connection is dead (reasonable for local gateway)
   const maxConsecutiveTimeouts = 3 // Exit process after this many consecutive timeouts
   let consecutiveTimeouts = 0
+  let consecutiveSseErrors = 0 // Track SSE-level errors (like body timeout)
   const pendingRequests = new Map<string | number, { timeout: NodeJS.Timeout; message: Message }>()
 
   // Store the original initialize message to re-send after reconnection
@@ -304,56 +380,98 @@ export function mcpProxy({
     return true
   }
 
-  // Helper to track a request and set up timeout
+  // Helper to track a request and set up ping-based health check
   function trackRequest(message: Message) {
     if (!message.id) return
 
-    const timeout = setTimeout(() => {
-      // Request timed out - server might be zombie
-      log(`[Timeout] Request ${message.id} (${message.method}) timed out after ${requestTimeoutMs}ms`)
-      const pending = pendingRequests.get(message.id)
-      pendingRequests.delete(message.id)
+    // If no serverUrl provided, fall back to simple timeout
+    if (!serverUrl) {
+      const timeout = setTimeout(() => {
+        log(`[Timeout] Request ${message.id} (${message.method}) timed out after ${requestTimeoutMs}ms (no ping URL)`)
+        handleRequestTimeout(message.id)
+      }, requestTimeoutMs)
+      pendingRequests.set(message.id, { timeout, message })
+      return
+    }
 
-      // Increment consecutive timeout counter
-      consecutiveTimeouts++
-      log(`[Timeout] Consecutive timeouts: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}`)
+    // Use ping-based health check
+    let pingFailures = 0
+    const pingInterval = setInterval(async () => {
+      // Don't ping if we're already reconnecting
+      if (isReconnecting || !connectionHealthy) {
+        return
+      }
 
-      // Mark connection as unhealthy and trigger reconnection
-      if (connectionHealthy && !isReconnecting) {
-        log('[Timeout] Marking connection as unhealthy and triggering reconnection...')
-        connectionHealthy = false
+      debugLog(`[Ping] Checking server health for request ${message.id}...`)
+      const isAlive = await pingServer(serverUrl)
 
-        // DON'T send error yet - queue the message for retry after reconnection
-        if (pending) {
-          log(`[Timeout] Queuing request ${message.id} for retry after reconnection...`)
-          queueMessageForRetry(pending.message)
+      if (isAlive) {
+        // Server is alive, reset failure counter
+        if (pingFailures > 0) {
+          debugLog(`[Ping] Server recovered, resetting failure counter (was ${pingFailures})`)
+          pingFailures = 0
         }
-
-        // Close current transport to trigger reconnection
-        currentTransportToServer.close().catch(onServerError)
-      } else if (isReconnecting) {
-        // Already reconnecting - just queue for retry
-        if (pending) {
-          log(`[Timeout] Already reconnecting, queuing request ${message.id} for retry...`)
-          queueMessageForRetry(pending.message)
-        }
+        debugLog(`[Ping] Server alive, continuing to wait for request ${message.id}`)
       } else {
-        // Connection already marked unhealthy but not reconnecting yet - queue for retry
-        if (pending) {
-          log(`[Timeout] Connection unhealthy, queuing request ${message.id} for retry...`)
-          queueMessageForRetry(pending.message)
+        // Ping failed
+        pingFailures++
+        log(`[Ping] Server ping failed for request ${message.id} (${pingFailures}/${MAX_PING_FAILURES})`)
+
+        if (pingFailures >= MAX_PING_FAILURES) {
+          log(`[Ping] Max ping failures reached, marking connection as dead`)
+          clearInterval(pingInterval)
+          handleRequestTimeout(message.id)
         }
       }
-    }, requestTimeoutMs)
+    }, PING_INTERVAL_MS)
 
-    pendingRequests.set(message.id, { timeout, message })
+    pendingRequests.set(message.id, { timeout: pingInterval as unknown as NodeJS.Timeout, message })
+  }
+
+  // Helper to handle request timeout (shared by both timeout and ping-based approaches)
+  function handleRequestTimeout(messageId: string | number) {
+    const pending = pendingRequests.get(messageId)
+    pendingRequests.delete(messageId)
+
+    // Increment consecutive timeout counter
+    consecutiveTimeouts++
+    log(`[Timeout] Consecutive timeouts: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}`)
+
+    // Mark connection as unhealthy and trigger reconnection
+    if (connectionHealthy && !isReconnecting) {
+      log('[Timeout] Marking connection as unhealthy and triggering reconnection...')
+      connectionHealthy = false
+
+      // DON'T send error yet - queue the message for retry after reconnection
+      if (pending) {
+        log(`[Timeout] Queuing request ${pending.message.id} for retry after reconnection...`)
+        queueMessageForRetry(pending.message)
+      }
+
+      // Close current transport to trigger reconnection
+      currentTransportToServer.close().catch(onServerError)
+    } else if (isReconnecting) {
+      // Already reconnecting - just queue for retry
+      if (pending) {
+        log(`[Timeout] Already reconnecting, queuing request ${pending.message.id} for retry...`)
+        queueMessageForRetry(pending.message)
+      }
+    } else {
+      // Connection already marked unhealthy but not reconnecting yet - queue for retry
+      if (pending) {
+        log(`[Timeout] Connection unhealthy, queuing request ${pending.message.id} for retry...`)
+        queueMessageForRetry(pending.message)
+      }
+    }
   }
 
   // Helper to clear request tracking when response is received
   function clearRequestTracking(messageId: string | number) {
     const pending = pendingRequests.get(messageId)
     if (pending) {
+      // Could be either setTimeout or setInterval, clearTimeout works for both
       clearTimeout(pending.timeout)
+      clearInterval(pending.timeout as unknown as NodeJS.Timeout)
       pendingRequests.delete(messageId)
       // Reset consecutive timeout counter on successful response
       if (consecutiveTimeouts > 0) {
@@ -363,10 +481,11 @@ export function mcpProxy({
     }
   }
 
-  // Clear all pending request timeouts
+  // Clear all pending request timeouts/intervals
   function clearAllRequestTracking() {
     for (const [id, pending] of pendingRequests) {
       clearTimeout(pending.timeout)
+      clearInterval(pending.timeout as unknown as NodeJS.Timeout)
     }
     pendingRequests.clear()
   }
@@ -490,6 +609,7 @@ export function mcpProxy({
             isReconnecting = false
             connectionHealthy = true
             consecutiveTimeouts = 0 // Reset timeout counter on successful reconnect
+            consecutiveSseErrors = 0 // Reset SSE error counter on successful reconnect
 
             // Flush pending messages
             log(`Flushing ${pendingMessages.length} queued messages...`)
@@ -625,6 +745,25 @@ export function mcpProxy({
   function onServerError(error: Error) {
     log('Error from remote server:', error)
     debugLog('Error from remote server', { stack: error.stack })
+
+    // Check if this is a connection-related error that should trigger reconnection
+    const errorStr = String(error).toLowerCase()
+    const isConnectionError = SSE_ERROR_PATTERNS.some(pattern => errorStr.includes(pattern.toLowerCase()))
+
+    if (isConnectionError) {
+      consecutiveSseErrors++
+      log(`[SSE Error] Connection error detected (${consecutiveSseErrors}/${MAX_SSE_ERRORS_BEFORE_RECONNECT}): ${errorStr.substring(0, 100)}`)
+
+      if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
+        log('[SSE Error] Max consecutive SSE errors reached, forcing reconnection...')
+        consecutiveSseErrors = 0
+        connectionHealthy = false
+        // Close the transport to trigger reconnection
+        currentTransportToServer.close().catch((e) => {
+          log('[SSE Error] Error closing transport:', e)
+        })
+      }
+    }
   }
 }
 

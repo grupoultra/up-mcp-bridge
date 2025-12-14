@@ -110,6 +110,7 @@ async function runProxy(
       ignoredTools,
       reconnectFn,
       reconnectOptions,
+      serverUrl,
     })
 
     // Start the local STDIO server

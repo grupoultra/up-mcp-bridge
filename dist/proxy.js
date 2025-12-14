@@ -10,7 +10,7 @@ import {
   mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers
-} from "./chunk-2DBJLY3Y.js";
+} from "./chunk-EOYXIWZ7.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
@@ -161,7 +161,8 @@ async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "h
       transportToServer: remoteTransport,
       ignoredTools,
       reconnectFn,
-      reconnectOptions
+      reconnectOptions,
+      serverUrl
     });
     await localTransport.start();
     log("Local STDIO server running");

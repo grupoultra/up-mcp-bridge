@@ -1,17 +1,22 @@
 {
-  "name": "mcp-remote",
-  "version": "0.1.31",
-  "description": "Remote proxy for Model Context Protocol, allowing local-only clients to connect to remote servers using oAuth",
+  "name": "mcp-remote-ultra",
+  "version": "1.0.0",
+  "description": "Remote proxy for MCP with auto-reconnect support. Fork of mcp-remote with transparent server restart handling.",
   "keywords": [
     "mcp",
     "stdio",
     "sse",
     "remote",
-    "oauth"
+    "oauth",
+    "auto-reconnect",
+    "reconnection"
   ],
-  "author": "Glen Maddern <glen@glenmaddern.com>",
+  "author": "César Obach <cesar.obach@ultrabase.net>",
+  "contributors": [
+    "Glen Maddern <glen@glenmaddern.com>"
+  ],
   "license": "MIT",
-  "repository": "https://github.com/geelen/mcp-remote",
+  "repository": "https://github.com/cobach/mcp-remote",
   "type": "module",
   "files": [
     "dist",
@@ -20,8 +25,8 @@
   ],
   "main": "dist/index.js",
   "bin": {
-    "mcp-remote": "dist/proxy.js",
-    "mcp-remote-client": "dist/client.js"
+    "mcp-remote-ultra": "dist/proxy.js",
+    "mcp-remote-ultra-client": "dist/client.js"
   },
   "scripts": {
     "build": "tsup",
