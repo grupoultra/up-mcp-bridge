@@ -209,6 +209,64 @@ You can specify multiple `--ignore-tool` flags to ignore different patterns. Exa
       ]
 ```
 
+### Auto-Reconnect (Experimental)
+
+⚠️ **This feature is experimental and has known issues being investigated.**
+
+To enable automatic reconnection when the remote server restarts, add the `--auto-reconnect` flag:
+
+```json
+{
+  "mcpServers": {
+    "remote-example": {
+      "command": "npx",
+      "args": [
+        "mcp-remote-ultra",
+        "https://remote.mcp.server/sse",
+        "--auto-reconnect"
+      ]
+    }
+  }
+}
+```
+
+This enables:
+- Automatic reconnection with exponential backoff when the server becomes unavailable
+- Message queuing during reconnection attempts
+- MCP session re-initialization after successful reconnection
+- Transparent handling for the MCP client
+
+**Default parameters:**
+- Max reconnection attempts: 20
+- Base delay: 1000ms
+- Max delay: 15000ms
+- Connection timeout: 5000ms
+
+**Optional explicit configuration:**
+```json
+"args": [
+  "mcp-remote-ultra",
+  "https://remote.mcp.server/sse",
+  "--auto-reconnect",
+  "--max-reconnect-attempts", "10",
+  "--max-reconnect-delay-ms", "30000",
+  "--connection-timeout-ms", "10000"
+]
+```
+
+#### Known Issues Under Investigation
+
+1. **MCP calls may hang after server restart**: In some scenarios, MCP tool calls hang indefinitely after the remote server restarts, even though the proxy reports a successful reconnection. A full restart cycle (stop client → restart server → start client) resolves the issue, but this defeats the purpose of auto-reconnect.
+
+2. **npx execution issues**: When using `npx mcp-remote-ultra`, environment variables (like `NODE_TLS_REJECT_UNAUTHORIZED`) may not propagate correctly to the spawned process, causing SSL issues with self-signed certificates.
+
+3. **HTTP vs HTTPS behavior**: The proxy behaves differently when connecting via HTTP vs HTTPS. HTTP connections (even on localhost) may exhibit different hanging behavior.
+
+**Status**: These issues are being actively investigated. If you encounter problems, please report them with:
+- Your configuration (sanitized)
+- Steps to reproduce
+- Logs from the proxy (`--debug` flag)
+
 ### Transport Strategies
 
 MCP Remote supports different transport strategies when connecting to an MCP server. This allows you to control whether it uses Server-Sent Events (SSE) or HTTP transport, and in what order it tries them.
