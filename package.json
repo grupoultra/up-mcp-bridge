@@ -1,5 +1,5 @@
 {
-  "name": "mcp-remote-ultra",
+  "name": "up-mcp-bridge",
   "version": "1.0.0",
   "description": "Remote proxy for MCP with auto-reconnect support. Fork of mcp-remote with transparent server restart handling.",
   "keywords": [
@@ -16,7 +16,7 @@
     "Glen Maddern <glen@glenmaddern.com>"
   ],
   "license": "MIT",
-  "repository": "https://github.com/cobach/mcp-remote",
+  "repository": "https://github.com/grupoultra/up-mcp-bridge",
   "type": "module",
   "files": [
     "dist",
@@ -25,8 +25,8 @@
   ],
   "main": "dist/index.js",
   "bin": {
-    "mcp-remote-ultra": "dist/proxy.js",
-    "mcp-remote-ultra-client": "dist/client.js"
+    "up-mcp-bridge": "dist/proxy.js",
+    "up-mcp-bridge-client": "dist/client.js"
   },
   "scripts": {
     "build": "tsup",

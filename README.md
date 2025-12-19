@@ -221,7 +221,7 @@ To enable automatic reconnection when the remote server restarts, add the `--aut
     "remote-example": {
       "command": "npx",
       "args": [
-        "mcp-remote-ultra",
+        "up-mcp-bridge",
         "https://remote.mcp.server/sse",
         "--auto-reconnect"
       ]
@@ -245,7 +245,7 @@ This enables:
 **Optional explicit configuration:**
 ```json
 "args": [
-  "mcp-remote-ultra",
+  "up-mcp-bridge",
   "https://remote.mcp.server/sse",
   "--auto-reconnect",
   "--max-reconnect-attempts", "10",
@@ -258,7 +258,7 @@ This enables:
 
 1. **MCP calls may hang after server restart**: In some scenarios, MCP tool calls hang indefinitely after the remote server restarts, even though the proxy reports a successful reconnection. A full restart cycle (stop client → restart server → start client) resolves the issue, but this defeats the purpose of auto-reconnect.
 
-2. **npx execution issues**: When using `npx mcp-remote-ultra`, environment variables (like `NODE_TLS_REJECT_UNAUTHORIZED`) may not propagate correctly to the spawned process, causing SSL issues with self-signed certificates.
+2. **npx execution issues**: When using `npx up-mcp-bridge`, environment variables (like `NODE_TLS_REJECT_UNAUTHORIZED`) may not propagate correctly to the spawned process, causing SSL issues with self-signed certificates.
 
 3. **HTTP vs HTTPS behavior**: The proxy behaves differently when connecting via HTTP vs HTTPS. HTTP connections (even on localhost) may exhibit different hanging behavior.
 
