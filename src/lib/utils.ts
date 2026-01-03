@@ -35,14 +35,28 @@ const MAX_SSE_ERRORS_BEFORE_RECONNECT = 2 // Number of consecutive SSE errors be
 const SSE_ERROR_PATTERNS = ['timeout', 'terminated', 'aborted', 'network', 'ECONNRESET', 'ECONNREFUSED']
 
 /**
+ * Result of a ping request
+ */
+interface PingResult {
+  alive: boolean
+  sessionExpired: boolean
+}
+
+/**
  * Pings the server to check if it's alive.
  * @param serverUrl The server URL (will derive /ping endpoint from it)
- * @returns true if server responds, false otherwise
+ * @param sessionId Optional sessionId for session-aware ping
+ * @returns PingResult with alive and sessionExpired status
  */
-async function pingServer(serverUrl: string): Promise<boolean> {
+async function pingServer(serverUrl: string, sessionId?: string): Promise<PingResult> {
   try {
     const url = new URL(serverUrl)
-    const pingUrl = `${url.protocol}//${url.host}/ping`
+    let pingUrl = `${url.protocol}//${url.host}/ping`
+
+    // Add sessionId for session-aware ping if available
+    if (sessionId) {
+      pingUrl += `?sessionId=${encodeURIComponent(sessionId)}`
+    }
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS)
@@ -53,13 +67,38 @@ async function pingServer(serverUrl: string): Promise<boolean> {
         method: 'GET',
       })
       clearTimeout(timeout)
-      return response.ok
+
+      // 410 Gone means session expired - server is alive but session is dead
+      if (response.status === 410) {
+        return { alive: true, sessionExpired: true }
+      }
+
+      return { alive: response.ok, sessionExpired: false }
     } catch (e) {
       clearTimeout(timeout)
-      return false
+      return { alive: false, sessionExpired: false }
     }
   } catch (e) {
-    return false
+    return { alive: false, sessionExpired: false }
+  }
+}
+
+/**
+ * Extracts sessionId from an SSE transport's internal endpoint URL
+ * @param transport The transport to extract sessionId from
+ * @returns The sessionId if found, undefined otherwise
+ */
+function extractSessionId(transport: Transport): string | undefined {
+  try {
+    // Access private _endpoint field from SSEClientTransport
+    // Note: _endpoint is a URL object, not a string
+    const endpoint = (transport as any)._endpoint as URL | undefined
+    if (!endpoint) return undefined
+
+    // Extract sessionId from URL search params
+    return endpoint.searchParams?.get('sessionId') || undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -232,6 +271,21 @@ export function mcpProxy({
   let consecutiveSseErrors = 0 // Track SSE-level errors (like body timeout)
   const pendingRequests = new Map<string | number, { timeout: NodeJS.Timeout; message: Message }>()
 
+  // Session ID for session-aware ping (extracted from SSE transport after connection is established)
+  let currentSessionId: string | undefined
+  let sessionIdExtracted = false
+
+  // Helper to extract sessionId (called after first message received, when _endpoint is populated)
+  function tryExtractSessionId() {
+    if (sessionIdExtracted) return
+    const sessionId = extractSessionId(currentTransportToServer)
+    if (sessionId) {
+      currentSessionId = sessionId
+      sessionIdExtracted = true
+      log(`[Session] Extracted sessionId from transport: ${sessionId}`)
+    }
+  }
+
   // Store the original initialize message to re-send after reconnection
   let savedInitializeMessage: Message | null = null
   let initializeIdCounter = 1000000 // Use high IDs for internal initialize messages to avoid conflicts
@@ -394,7 +448,7 @@ export function mcpProxy({
       return
     }
 
-    // Use ping-based health check
+    // Use ping-based health check with session awareness
     let pingFailures = 0
     const pingInterval = setInterval(async () => {
       // Don't ping if we're already reconnecting
@@ -403,9 +457,25 @@ export function mcpProxy({
       }
 
       debugLog(`[Ping] Checking server health for request ${message.id}...`)
-      const isAlive = await pingServer(serverUrl)
+      const pingResult = await pingServer(serverUrl, currentSessionId)
 
-      if (isAlive) {
+      // Session expired (410 Gone) - trigger immediate reconnection
+      if (pingResult.sessionExpired) {
+        log(`[Ping] Session expired for request ${message.id}, triggering immediate reconnection`)
+        clearInterval(pingInterval)
+        connectionHealthy = false
+        // Queue the message for retry after reconnection
+        const pending = pendingRequests.get(message.id)
+        if (pending) {
+          pendingRequests.delete(message.id)
+          queueMessageForRetry(pending.message)
+        }
+        // Close transport to trigger reconnection
+        currentTransportToServer.close().catch(onServerError)
+        return
+      }
+
+      if (pingResult.alive) {
         // Server is alive, reset failure counter
         if (pingFailures > 0) {
           debugLog(`[Ping] Server recovered, resetting failure counter (was ${pingFailures})`)
@@ -532,6 +602,9 @@ export function mcpProxy({
       const message = messageTransformer.interceptResponse(_message as any)
       log('[Remote→Local]', message.method || message.id)
 
+      // Try to extract sessionId on first message (when _endpoint should be populated)
+      tryExtractSessionId()
+
       // Clear the timeout for this request if it's a response
       if (message.id !== undefined) {
         clearRequestTracking(message.id)
@@ -610,6 +683,13 @@ export function mcpProxy({
             connectionHealthy = true
             consecutiveTimeouts = 0 // Reset timeout counter on successful reconnect
             consecutiveSseErrors = 0 // Reset SSE error counter on successful reconnect
+
+            // Reset sessionId extraction flag for new transport
+            sessionIdExtracted = false
+            currentSessionId = undefined
+
+            // Try to extract sessionId now (endpoint should be populated after reinit)
+            tryExtractSessionId()
 
             // Flush pending messages
             log(`Flushing ${pendingMessages.length} queued messages...`)
