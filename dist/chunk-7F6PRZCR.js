@@ -20026,10 +20026,13 @@ var PING_TIMEOUT_MS = 2e3;
 var MAX_PING_FAILURES = 3;
 var MAX_SSE_ERRORS_BEFORE_RECONNECT = 2;
 var SSE_ERROR_PATTERNS = ["timeout", "terminated", "aborted", "network", "ECONNRESET", "ECONNREFUSED"];
-async function pingServer(serverUrl) {
+async function pingServer(serverUrl, sessionId) {
   try {
     const url2 = new URL(serverUrl);
-    const pingUrl = `${url2.protocol}//${url2.host}/ping`;
+    let pingUrl = `${url2.protocol}//${url2.host}/ping`;
+    if (sessionId) {
+      pingUrl += `?sessionId=${encodeURIComponent(sessionId)}`;
+    }
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
     try {
@@ -20038,13 +20041,25 @@ async function pingServer(serverUrl) {
         method: "GET"
       });
       clearTimeout(timeout);
-      return response.ok;
+      if (response.status === 410) {
+        return { alive: true, sessionExpired: true };
+      }
+      return { alive: response.ok, sessionExpired: false };
     } catch (e) {
       clearTimeout(timeout);
-      return false;
+      return { alive: false, sessionExpired: false };
     }
   } catch (e) {
-    return false;
+    return { alive: false, sessionExpired: false };
+  }
+}
+function extractSessionId(transport) {
+  try {
+    const endpoint = transport._endpoint;
+    if (!endpoint) return void 0;
+    return endpoint.searchParams?.get("sessionId") || void 0;
+  } catch {
+    return void 0;
   }
 }
 var pid = process.pid;
@@ -20154,6 +20169,17 @@ function mcpProxy({
   let consecutiveTimeouts = 0;
   let consecutiveSseErrors = 0;
   const pendingRequests = /* @__PURE__ */ new Map();
+  let currentSessionId;
+  let sessionIdExtracted = false;
+  function tryExtractSessionId() {
+    if (sessionIdExtracted) return;
+    const sessionId = extractSessionId(currentTransportToServer);
+    if (sessionId) {
+      currentSessionId = sessionId;
+      sessionIdExtracted = true;
+      log(`[Session] Extracted sessionId from transport: ${sessionId}`);
+    }
+  }
   let savedInitializeMessage = null;
   let initializeIdCounter = 1e6;
   async function reinitializeMcpSession(transport) {
@@ -20287,8 +20313,20 @@ function mcpProxy({
         return;
       }
       debugLog(`[Ping] Checking server health for request ${message.id}...`);
-      const isAlive = await pingServer(serverUrl);
-      if (isAlive) {
+      const pingResult = await pingServer(serverUrl, currentSessionId);
+      if (pingResult.sessionExpired) {
+        log(`[Ping] Session expired for request ${message.id}, triggering immediate reconnection`);
+        clearInterval(pingInterval);
+        connectionHealthy = false;
+        const pending = pendingRequests.get(message.id);
+        if (pending) {
+          pendingRequests.delete(message.id);
+          queueMessageForRetry(pending.message);
+        }
+        currentTransportToServer.close().catch(onServerError);
+        return;
+      }
+      if (pingResult.alive) {
         if (pingFailures > 0) {
           debugLog(`[Ping] Server recovered, resetting failure counter (was ${pingFailures})`);
           pingFailures = 0;
@@ -20386,6 +20424,7 @@ function mcpProxy({
     serverTransport.onmessage = (_message) => {
       const message = messageTransformer.interceptResponse(_message);
       log("[Remote\u2192Local]", message.method || message.id);
+      tryExtractSessionId();
       if (message.id !== void 0) {
         clearRequestTracking(message.id);
       }
@@ -20437,6 +20476,9 @@ function mcpProxy({
             connectionHealthy = true;
             consecutiveTimeouts = 0;
             consecutiveSseErrors = 0;
+            sessionIdExtracted = false;
+            currentSessionId = void 0;
+            tryExtractSessionId();
             log(`Flushing ${pendingMessages.length} queued messages...`);
             while (pendingMessages.length > 0) {
               const pending = pendingMessages.shift();

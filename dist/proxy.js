@@ -10,7 +10,7 @@ import {
   mcpProxy,
   parseCommandLineArgs,
   setupSignalHandlers
-} from "./chunk-EOYXIWZ7.js";
+} from "./chunk-7F6PRZCR.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
@@ -172,8 +172,8 @@ async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "h
     }
     log("Press Ctrl+C to exit");
     const cleanup = async () => {
-      await remoteTransport.close();
       await localTransport.close();
+      await remoteTransport.close();
       if (server) {
         server.close();
       }

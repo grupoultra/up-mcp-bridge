@@ -123,9 +123,11 @@ async function runProxy(
     log('Press Ctrl+C to exit')
 
     // Setup cleanup handler
+    // IMPORTANT: Close local transport FIRST to set transportToClientClosed=true
+    // This prevents the remote transport's onclose handler from attempting reconnection
     const cleanup = async () => {
+      await localTransport.close()   // Must be first to prevent reconnection attempt
       await remoteTransport.close()
-      await localTransport.close()
       // Only close the server if it was initialized
       if (server) {
         server.close()
