@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.0";
+var version2 = "1.0.1";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -21033,17 +21033,28 @@ async function parseCommandLineArgs(args, usage) {
   };
 }
 function setupSignalHandlers(cleanup) {
-  process.on("SIGINT", async () => {
-    log("\nShutting down...");
-    await cleanup();
-    process.exit(0);
-  });
+  let isShuttingDown = false;
+  const gracefulShutdown = async (signal) => {
+    if (isShuttingDown) {
+      log(`[Shutdown] Already shutting down, ignoring ${signal}`);
+      return;
+    }
+    isShuttingDown = true;
+    log(`[Shutdown] Received ${signal}, cleaning up...`);
+    try {
+      await cleanup();
+      log("[Shutdown] Cleanup complete, exiting with code 0");
+      process.exit(0);
+    } catch (error2) {
+      log("[Shutdown] Error during cleanup:", error2);
+      process.exit(1);
+    }
+  };
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
   process.stdin.resume();
-  process.stdin.on("end", async () => {
-    log("\nShutting down...");
-    await cleanup();
-    process.exit(0);
-  });
+  process.stdin.on("end", () => gracefulShutdown("stdin-end"));
+  process.stdin.on("close", () => gracefulShutdown("stdin-close"));
 }
 function getServerUrlHash(serverUrl, authorizeResource, headers) {
   const parts = [serverUrl];

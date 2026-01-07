@@ -1479,19 +1479,32 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
  * @param cleanup Cleanup function to run on shutdown
  */
 export function setupSignalHandlers(cleanup: () => Promise<void>) {
-  process.on('SIGINT', async () => {
-    log('\nShutting down...')
-    await cleanup()
-    process.exit(0)
-  })
+  let isShuttingDown = false
+
+  const gracefulShutdown = async (signal: string) => {
+    if (isShuttingDown) {
+      log(`[Shutdown] Already shutting down, ignoring ${signal}`)
+      return
+    }
+    isShuttingDown = true
+    log(`[Shutdown] Received ${signal}, cleaning up...`)
+    try {
+      await cleanup()
+      log('[Shutdown] Cleanup complete, exiting with code 0')
+      process.exit(0)
+    } catch (error) {
+      log('[Shutdown] Error during cleanup:', error)
+      process.exit(1)
+    }
+  }
+
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'))
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 
   // Keep the process alive
   process.stdin.resume()
-  process.stdin.on('end', async () => {
-    log('\nShutting down...')
-    await cleanup()
-    process.exit(0)
-  })
+  process.stdin.on('end', () => gracefulShutdown('stdin-end'))
+  process.stdin.on('close', () => gracefulShutdown('stdin-close'))
 }
 
 /**
