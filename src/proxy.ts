@@ -11,11 +11,14 @@
 
 import { EventEmitter } from 'events'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { connectToRemoteServer, log, debugLog, mcpProxy, parseCommandLineArgs, setupSignalHandlers, TransportStrategy, ReconnectOptions } from './lib/utils'
+import { connectToRemoteServer, log, debugLog, mcpProxy, parseCommandLineArgs, setupSignalHandlers, TransportStrategy, ReconnectOptions, MCP_REMOTE_VERSION } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
 import { fetchAuthorizationServerMetadata } from './lib/authorization-server-metadata'
+
+// Log version immediately on startup
+log(`[Startup] up-mcp-bridge v${MCP_REMOTE_VERSION} starting...`)
 
 /**
  * Main function to run the proxy

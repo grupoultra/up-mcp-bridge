@@ -9,8 +9,9 @@ import {
   log,
   mcpProxy,
   parseCommandLineArgs,
-  setupSignalHandlers
-} from "./chunk-3OI3JDYP.js";
+  setupSignalHandlers,
+  version
+} from "./chunk-HVGYICF6.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
@@ -111,6 +112,7 @@ var StdioServerTransport = class {
 };
 
 // src/proxy.ts
+log(`[Startup] up-mcp-bridge v${version} starting...`);
 async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "http-first", host, staticOAuthClientMetadata, staticOAuthClientInfo, authorizeResource, ignoredTools, authTimeoutMs, serverUrlHash, reconnectOptions) {
   const events = new EventEmitter();
   const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs);
