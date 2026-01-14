@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.0";
+var version2 = "1.0.1";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20025,7 +20025,7 @@ var PING_INTERVAL_MS = 1e3;
 var PING_TIMEOUT_MS = 2e3;
 var MAX_PING_FAILURES = 3;
 var MAX_SSE_ERRORS_BEFORE_RECONNECT = 2;
-var SSE_ERROR_PATTERNS = ["timeout", "terminated", "aborted", "network", "ECONNRESET", "ECONNREFUSED"];
+var SSE_ERROR_PATTERNS = ["timeout", "terminated", "aborted", "network", "ECONNRESET", "ECONNREFUSED", "session not found"];
 async function pingServer(serverUrl, sessionId) {
   try {
     const url2 = new URL(serverUrl);

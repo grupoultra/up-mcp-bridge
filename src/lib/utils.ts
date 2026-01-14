@@ -32,7 +32,7 @@ const MAX_PING_FAILURES = 3 // Number of consecutive ping failures before markin
 
 // SSE error detection for reconnection
 const MAX_SSE_ERRORS_BEFORE_RECONNECT = 2 // Number of consecutive SSE errors before forcing reconnect
-const SSE_ERROR_PATTERNS = ['timeout', 'terminated', 'aborted', 'network', 'ECONNRESET', 'ECONNREFUSED']
+const SSE_ERROR_PATTERNS = ['timeout', 'terminated', 'aborted', 'network', 'ECONNRESET', 'ECONNREFUSED', 'session not found']
 
 /**
  * Result of a ping request
