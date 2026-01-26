@@ -431,7 +431,41 @@ export function mcpProxy({
       queuedMessageIds.add(message.id)
     }
     pendingMessages.push({ message, timestamp: Date.now() })
+    log(`[Queue] Queued message ${message.id || '(no id)'} (${message.method || 'response'}), queue size: ${pendingMessages.length}`)
     return true
+  }
+
+  // Helper to cancel a queued or in-flight request
+  function cancelRequest(requestId: string | number): boolean {
+    // Check if it's in the pending queue (not yet sent)
+    const queueIndex = pendingMessages.findIndex(p => p.message.id === requestId)
+    if (queueIndex !== -1) {
+      const removed = pendingMessages.splice(queueIndex, 1)[0]
+      queuedMessageIds.delete(requestId)
+      log(`[Cancel] Removed queued request ${requestId} (${removed.message.method}) from queue, queue size: ${pendingMessages.length}`)
+      return true
+    }
+
+    // Check if it's being tracked (already sent, waiting for response)
+    const pending = pendingRequests.get(requestId)
+    if (pending) {
+      clearTimeout(pending.timeout)
+      clearInterval(pending.timeout as unknown as NodeJS.Timeout)
+      pendingRequests.delete(requestId)
+      log(`[Cancel] Stopped tracking in-flight request ${requestId} (${pending.message.method})`)
+      return true
+    }
+
+    log(`[Cancel] Request ${requestId} not found in queue or pending requests`)
+    return false
+  }
+
+  // Helper to set connection health with logging
+  function setConnectionHealthy(newValue: boolean, reason: string) {
+    if (connectionHealthy !== newValue) {
+      log(`[Health] Connection health: ${connectionHealthy} → ${newValue} (${reason})`)
+      connectionHealthy = newValue
+    }
   }
 
   // Helper to track a request and set up ping-based health check
@@ -463,7 +497,7 @@ export function mcpProxy({
       if (pingResult.sessionExpired) {
         log(`[Ping] Session expired for request ${message.id}, triggering immediate reconnection`)
         clearInterval(pingInterval)
-        connectionHealthy = false
+        setConnectionHealthy(false, 'session expired (410 Gone)')
         // Queue the message for retry after reconnection
         const pending = pendingRequests.get(message.id)
         if (pending) {
@@ -510,7 +544,7 @@ export function mcpProxy({
     // Mark connection as unhealthy and trigger reconnection
     if (connectionHealthy && !isReconnecting) {
       log('[Timeout] Marking connection as unhealthy and triggering reconnection...')
-      connectionHealthy = false
+      setConnectionHealthy(false, 'request timeout')
 
       // DON'T send error yet - queue the message for retry after reconnection
       if (pending) {
@@ -617,7 +651,12 @@ export function mcpProxy({
         error: message.error,
       })
 
-      transportToClient.send(message).catch(onClientError)
+      transportToClient.send(message).then(() => {
+        log(`[Forward] Response ${message.id || message.method} forwarded to client`)
+      }).catch((error) => {
+        log(`[Forward] FAILED to forward response ${message.id || message.method} to client:`, error)
+        onClientError(error)
+      })
     }
 
     serverTransport.onclose = async () => {
@@ -627,7 +666,7 @@ export function mcpProxy({
 
       // Clear all pending request timeouts since we're reconnecting
       clearAllRequestTracking()
-      connectionHealthy = false
+      setConnectionHealthy(false, 'remote transport closed')
 
       // Check if auto-reconnect is enabled
       if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
@@ -680,7 +719,7 @@ export function mcpProxy({
             // Reset state
             reconnectAttempts = 0
             isReconnecting = false
-            connectionHealthy = true
+            setConnectionHealthy(true, 'reconnection successful')
             consecutiveTimeouts = 0 // Reset timeout counter on successful reconnect
             consecutiveSseErrors = 0 // Reset SSE error counter on successful reconnect
 
@@ -692,7 +731,10 @@ export function mcpProxy({
             tryExtractSessionId()
 
             // Flush pending messages
-            log(`Flushing ${pendingMessages.length} queued messages...`)
+            const queueSize = pendingMessages.length
+            log(`[Queue] Flushing ${queueSize} queued messages...`)
+            let flushedCount = 0
+            let expiredCount = 0
             while (pendingMessages.length > 0) {
               const pending = pendingMessages.shift()!
               // Remove from tracking set
@@ -701,14 +743,18 @@ export function mcpProxy({
               }
               // Check if message hasn't expired
               if (Date.now() - pending.timestamp < messageTimeoutMs) {
-                log('[Local→Remote] (queued)', pending.message.method || pending.message.id)
+                log(`[Queue] Sending queued message ${pending.message.id || '(no id)'} (${pending.message.method})`)
                 // Track the request for timeout
                 trackRequest(pending.message)
                 currentTransportToServer.send(pending.message).catch(onServerError)
+                flushedCount++
               } else {
+                log(`[Queue] Message ${pending.message.id} expired, sending error`)
                 sendErrorForPendingMessage(pending, 'Request timed out while waiting for server reconnection')
+                expiredCount++
               }
             }
+            log(`[Queue] Flush complete: ${flushedCount} sent, ${expiredCount} expired`)
 
             return // Successfully reconnected, exit the loop
           } catch (error) {
@@ -727,11 +773,11 @@ export function mcpProxy({
 
         transportToServerClosed = true
         isReconnecting = false
-        connectionHealthy = false
+        setConnectionHealthy(false, 'max reconnect attempts reached')
         transportToClient.close().catch(onClientError)
       } else {
         transportToServerClosed = true
-        connectionHealthy = false
+        setConnectionHealthy(false, 'remote transport closed (no auto-reconnect)')
         debugLog('Remote transport closed, closing local transport')
 
         // Send errors for any pending messages
@@ -751,6 +797,25 @@ export function mcpProxy({
     // If interceptor returns MESSAGE_BLOCKED, don't forward the message
     if (isMessageBlocked(message)) {
       return
+    }
+
+    // Handle cancellation notifications from client (MCP protocol)
+    if (message.method === 'notifications/cancelled') {
+      const requestId = message.params?.requestId
+      if (requestId !== undefined) {
+        log(`[Cancel] Received cancellation for request ${requestId}`)
+        const cancelled = cancelRequest(requestId)
+        if (cancelled) {
+          log(`[Cancel] Successfully cancelled request ${requestId}`)
+        }
+        // Forward cancellation to server anyway (it might be processing)
+        if (connectionHealthy && !isReconnecting) {
+          currentTransportToServer.send(message).catch((error) => {
+            log(`[Cancel] Failed to forward cancellation to server:`, error)
+          })
+        }
+        return // Don't queue cancellation notifications
+      }
     }
 
     log('[Local→Remote]', message.method || message.id)
@@ -797,7 +862,7 @@ export function mcpProxy({
       // Queue the message and trigger reconnection handling
       log('[Local→Remote] Send failed, queuing message:', error)
       queueMessageForRetry(message)
-      connectionHealthy = false
+      setConnectionHealthy(false, 'send failed')
       onServerError(error)
     })
   }
@@ -837,7 +902,7 @@ export function mcpProxy({
       if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
         log('[SSE Error] Max consecutive SSE errors reached, forcing reconnection...')
         consecutiveSseErrors = 0
-        connectionHealthy = false
+        setConnectionHealthy(false, 'max SSE errors')
         // Close the transport to trigger reconnection
         currentTransportToServer.close().catch((e) => {
           log('[SSE Error] Error closing transport:', e)

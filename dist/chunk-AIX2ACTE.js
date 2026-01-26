@@ -20295,7 +20295,33 @@ function mcpProxy({
       queuedMessageIds.add(message.id);
     }
     pendingMessages.push({ message, timestamp: Date.now() });
+    log(`[Queue] Queued message ${message.id || "(no id)"} (${message.method || "response"}), queue size: ${pendingMessages.length}`);
     return true;
+  }
+  function cancelRequest(requestId) {
+    const queueIndex = pendingMessages.findIndex((p) => p.message.id === requestId);
+    if (queueIndex !== -1) {
+      const removed = pendingMessages.splice(queueIndex, 1)[0];
+      queuedMessageIds.delete(requestId);
+      log(`[Cancel] Removed queued request ${requestId} (${removed.message.method}) from queue, queue size: ${pendingMessages.length}`);
+      return true;
+    }
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timeout);
+      clearInterval(pending.timeout);
+      pendingRequests.delete(requestId);
+      log(`[Cancel] Stopped tracking in-flight request ${requestId} (${pending.message.method})`);
+      return true;
+    }
+    log(`[Cancel] Request ${requestId} not found in queue or pending requests`);
+    return false;
+  }
+  function setConnectionHealthy(newValue, reason) {
+    if (connectionHealthy !== newValue) {
+      log(`[Health] Connection health: ${connectionHealthy} \u2192 ${newValue} (${reason})`);
+      connectionHealthy = newValue;
+    }
   }
   function trackRequest(message) {
     if (!message.id) return;
@@ -20317,7 +20343,7 @@ function mcpProxy({
       if (pingResult.sessionExpired) {
         log(`[Ping] Session expired for request ${message.id}, triggering immediate reconnection`);
         clearInterval(pingInterval);
-        connectionHealthy = false;
+        setConnectionHealthy(false, "session expired (410 Gone)");
         const pending = pendingRequests.get(message.id);
         if (pending) {
           pendingRequests.delete(message.id);
@@ -20351,7 +20377,7 @@ function mcpProxy({
     log(`[Timeout] Consecutive timeouts: ${consecutiveTimeouts}/${maxConsecutiveTimeouts}`);
     if (connectionHealthy && !isReconnecting) {
       log("[Timeout] Marking connection as unhealthy and triggering reconnection...");
-      connectionHealthy = false;
+      setConnectionHealthy(false, "request timeout");
       if (pending) {
         log(`[Timeout] Queuing request ${pending.message.id} for retry after reconnection...`);
         queueMessageForRetry(pending.message);
@@ -20434,14 +20460,19 @@ function mcpProxy({
         result: message.result ? "result-present" : void 0,
         error: message.error
       });
-      transportToClient.send(message).catch(onClientError);
+      transportToClient.send(message).then(() => {
+        log(`[Forward] Response ${message.id || message.method} forwarded to client`);
+      }).catch((error2) => {
+        log(`[Forward] FAILED to forward response ${message.id || message.method} to client:`, error2);
+        onClientError(error2);
+      });
     };
     serverTransport.onclose = async () => {
       if (transportToClientClosed) {
         return;
       }
       clearAllRequestTracking();
-      connectionHealthy = false;
+      setConnectionHealthy(false, "remote transport closed");
       if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
         log(`Remote transport closed. Starting reconnection loop...`);
         debugLog("Remote transport closed, starting reconnection loop", { attempt: reconnectAttempts + 1 });
@@ -20473,26 +20504,33 @@ function mcpProxy({
             }
             reconnectAttempts = 0;
             isReconnecting = false;
-            connectionHealthy = true;
+            setConnectionHealthy(true, "reconnection successful");
             consecutiveTimeouts = 0;
             consecutiveSseErrors = 0;
             sessionIdExtracted = false;
             currentSessionId = void 0;
             tryExtractSessionId();
-            log(`Flushing ${pendingMessages.length} queued messages...`);
+            const queueSize = pendingMessages.length;
+            log(`[Queue] Flushing ${queueSize} queued messages...`);
+            let flushedCount = 0;
+            let expiredCount = 0;
             while (pendingMessages.length > 0) {
               const pending = pendingMessages.shift();
               if (pending.message.id) {
                 queuedMessageIds.delete(pending.message.id);
               }
               if (Date.now() - pending.timestamp < messageTimeoutMs) {
-                log("[Local\u2192Remote] (queued)", pending.message.method || pending.message.id);
+                log(`[Queue] Sending queued message ${pending.message.id || "(no id)"} (${pending.message.method})`);
                 trackRequest(pending.message);
                 currentTransportToServer.send(pending.message).catch(onServerError);
+                flushedCount++;
               } else {
+                log(`[Queue] Message ${pending.message.id} expired, sending error`);
                 sendErrorForPendingMessage(pending, "Request timed out while waiting for server reconnection");
+                expiredCount++;
               }
             }
+            log(`[Queue] Flush complete: ${flushedCount} sent, ${expiredCount} expired`);
             return;
           } catch (error2) {
             log(`Reconnection attempt ${reconnectAttempts} failed:`, error2);
@@ -20504,11 +20542,11 @@ function mcpProxy({
         flushAllPendingMessagesWithError("Server connection lost and reconnection failed");
         transportToServerClosed = true;
         isReconnecting = false;
-        connectionHealthy = false;
+        setConnectionHealthy(false, "max reconnect attempts reached");
         transportToClient.close().catch(onClientError);
       } else {
         transportToServerClosed = true;
-        connectionHealthy = false;
+        setConnectionHealthy(false, "remote transport closed (no auto-reconnect)");
         debugLog("Remote transport closed, closing local transport");
         flushAllPendingMessagesWithError("Server connection closed");
         transportToClient.close().catch(onClientError);
@@ -20520,6 +20558,22 @@ function mcpProxy({
     const message = messageTransformer.interceptRequest(_message);
     if (isMessageBlocked(message)) {
       return;
+    }
+    if (message.method === "notifications/cancelled") {
+      const requestId = message.params?.requestId;
+      if (requestId !== void 0) {
+        log(`[Cancel] Received cancellation for request ${requestId}`);
+        const cancelled = cancelRequest(requestId);
+        if (cancelled) {
+          log(`[Cancel] Successfully cancelled request ${requestId}`);
+        }
+        if (connectionHealthy && !isReconnecting) {
+          currentTransportToServer.send(message).catch((error2) => {
+            log(`[Cancel] Failed to forward cancellation to server:`, error2);
+          });
+        }
+        return;
+      }
     }
     log("[Local\u2192Remote]", message.method || message.id);
     debugLog("Local \u2192 Remote message", {
@@ -20550,7 +20604,7 @@ function mcpProxy({
       }
       log("[Local\u2192Remote] Send failed, queuing message:", error2);
       queueMessageForRetry(message);
-      connectionHealthy = false;
+      setConnectionHealthy(false, "send failed");
       onServerError(error2);
     });
   };
@@ -20579,7 +20633,7 @@ function mcpProxy({
       if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
         log("[SSE Error] Max consecutive SSE errors reached, forcing reconnection...");
         consecutiveSseErrors = 0;
-        connectionHealthy = false;
+        setConnectionHealthy(false, "max SSE errors");
         currentTransportToServer.close().catch((e) => {
           log("[SSE Error] Error closing transport:", e);
         });
