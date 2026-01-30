@@ -261,6 +261,32 @@ export function mcpProxy({
   let reconnectAttempts = 0
   let connectionHealthy = true
   const pendingMessages: { message: Message; timestamp: number }[] = []
+
+  // BUG-003: Track message timing for diagnosis
+  const messageTimings = new Map<string | number, { receivedAt: number; sentAt?: number; method?: string }>()
+  let lastActivityTime = Date.now()
+
+  // BUG-003: Periodic status logging (every 30s if messages are pending)
+  const statusInterval = setInterval(() => {
+    const now = Date.now()
+    const idleMs = now - lastActivityTime
+
+    // Log if we have pending messages or requests, or if idle for too long
+    if (pendingMessages.length > 0 || pendingRequests.size > 0 || idleMs > 60000) {
+      log(`[BUG-003 Status] queue=${pendingMessages.length}, pending=${pendingRequests.size}, healthy=${connectionHealthy}, reconnecting=${isReconnecting}, idle=${Math.round(idleMs/1000)}s`)
+
+      // Log details of stuck requests
+      if (pendingRequests.size > 0) {
+        for (const [id, pending] of pendingRequests) {
+          const timing = messageTimings.get(id)
+          const waitingMs = timing ? now - timing.receivedAt : 0
+          if (waitingMs > 5000) {
+            log(`[BUG-003 Stuck] Request ${id} (${pending.message.method}) waiting ${Math.round(waitingMs/1000)}s for response`)
+          }
+        }
+      }
+    }
+  }, 30000)
   const queuedMessageIds = new Set<string | number>() // Track queued message IDs to prevent duplicates
   const maxDelayMs = reconnectOptions.maxDelayMs ?? 15000
   const connectionTimeoutMs = reconnectOptions.connectionTimeoutMs ?? 5000
@@ -632,12 +658,31 @@ export function mcpProxy({
 
   function setupServerTransportHandlers(serverTransport: Transport) {
     serverTransport.onmessage = (_message) => {
+      const responseReceivedAt = Date.now()
+      lastActivityTime = responseReceivedAt
+
       // TODO: fix types
       const message = messageTransformer.interceptResponse(_message as any)
       log('[Remote→Local]', message.method || message.id)
 
       // Try to extract sessionId on first message (when _endpoint should be populated)
       tryExtractSessionId()
+
+      // BUG-003: Log response timing
+      if (message.id !== undefined) {
+        const timing = messageTimings.get(message.id)
+        if (timing) {
+          const totalMs = responseReceivedAt - timing.receivedAt
+          const serverMs = timing.sentAt ? responseReceivedAt - timing.sentAt : totalMs
+          log(`[BUG-003 Resp] Message ${message.id} (${timing.method}) response in ${totalMs}ms total (${serverMs}ms server)`)
+          messageTimings.delete(message.id)
+
+          // Warn if response took too long
+          if (totalMs > 30000) {
+            log(`[BUG-003 Slow] Message ${message.id} took ${Math.round(totalMs/1000)}s - investigate!`)
+          }
+        }
+      }
 
       // Clear the timeout for this request if it's a response
       if (message.id !== undefined) {
@@ -791,6 +836,9 @@ export function mcpProxy({
   }
 
   transportToClient.onmessage = (_message) => {
+    const receivedAt = Date.now()
+    lastActivityTime = receivedAt
+
     // TODO: fix types
     const message = messageTransformer.interceptRequest(_message as any)
 
@@ -818,6 +866,12 @@ export function mcpProxy({
       }
     }
 
+    // BUG-003: Track message timing
+    if (message.id !== undefined) {
+      messageTimings.set(message.id, { receivedAt, method: message.method })
+      log(`[BUG-003 Recv] Message ${message.id} (${message.method}) received from client at ${new Date(receivedAt).toISOString()}`)
+    }
+
     log('[Local→Remote]', message.method || message.id)
 
     debugLog('Local → Remote message', {
@@ -840,6 +894,9 @@ export function mcpProxy({
 
     // If reconnecting or connection is unhealthy, queue the message
     if (isReconnecting || !connectionHealthy) {
+      const timing = message.id !== undefined ? messageTimings.get(message.id) : undefined
+      const delayMs = timing ? Date.now() - timing.receivedAt : 0
+      log(`[BUG-003 Queue] Message ${message.id || '(no id)'} (${message.method}) queued after ${delayMs}ms - connection unhealthy or reconnecting`)
       log('[Local→Remote] (queuing during reconnect)', message.method || message.id)
       queueMessageForRetry(message)
 
@@ -853,7 +910,25 @@ export function mcpProxy({
     // Track requests that expect a response (have an id)
     trackRequest(message)
 
-    currentTransportToServer.send(message).catch((error) => {
+    // BUG-003: Log when message is about to be sent
+    const sendStartTime = Date.now()
+    if (message.id !== undefined) {
+      const timing = messageTimings.get(message.id)
+      if (timing) {
+        timing.sentAt = sendStartTime
+        const delayMs = sendStartTime - timing.receivedAt
+        if (delayMs > 100) {
+          log(`[BUG-003 Delay] Message ${message.id} (${message.method}) took ${delayMs}ms from receive to send`)
+        }
+      }
+    }
+
+    currentTransportToServer.send(message).then(() => {
+      const sendDuration = Date.now() - sendStartTime
+      if (sendDuration > 1000) {
+        log(`[BUG-003 SendSlow] Message ${message.id || '(no id)'} (${message.method}) send() took ${sendDuration}ms`)
+      }
+    }).catch((error) => {
       // Clear the timeout since send failed
       if (message.id !== undefined) {
         clearRequestTracking(message.id)
@@ -871,6 +946,9 @@ export function mcpProxy({
   setupServerTransportHandlers(transportToServer)
 
   transportToClient.onclose = () => {
+    // BUG-003: Cleanup status interval
+    clearInterval(statusInterval)
+
     if (transportToServerClosed) {
       return
     }

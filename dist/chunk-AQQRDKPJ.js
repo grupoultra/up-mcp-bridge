@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.1";
+var version2 = "1.0.11";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20160,6 +20160,24 @@ function mcpProxy({
   let reconnectAttempts = 0;
   let connectionHealthy = true;
   const pendingMessages = [];
+  const messageTimings = /* @__PURE__ */ new Map();
+  let lastActivityTime = Date.now();
+  const statusInterval = setInterval(() => {
+    const now = Date.now();
+    const idleMs = now - lastActivityTime;
+    if (pendingMessages.length > 0 || pendingRequests.size > 0 || idleMs > 6e4) {
+      log(`[BUG-003 Status] queue=${pendingMessages.length}, pending=${pendingRequests.size}, healthy=${connectionHealthy}, reconnecting=${isReconnecting}, idle=${Math.round(idleMs / 1e3)}s`);
+      if (pendingRequests.size > 0) {
+        for (const [id, pending] of pendingRequests) {
+          const timing = messageTimings.get(id);
+          const waitingMs = timing ? now - timing.receivedAt : 0;
+          if (waitingMs > 5e3) {
+            log(`[BUG-003 Stuck] Request ${id} (${pending.message.method}) waiting ${Math.round(waitingMs / 1e3)}s for response`);
+          }
+        }
+      }
+    }
+  }, 3e4);
   const queuedMessageIds = /* @__PURE__ */ new Set();
   const maxDelayMs = reconnectOptions.maxDelayMs ?? 15e3;
   const connectionTimeoutMs = reconnectOptions.connectionTimeoutMs ?? 5e3;
@@ -20448,9 +20466,23 @@ function mcpProxy({
   });
   function setupServerTransportHandlers(serverTransport) {
     serverTransport.onmessage = (_message) => {
+      const responseReceivedAt = Date.now();
+      lastActivityTime = responseReceivedAt;
       const message = messageTransformer.interceptResponse(_message);
       log("[Remote\u2192Local]", message.method || message.id);
       tryExtractSessionId();
+      if (message.id !== void 0) {
+        const timing = messageTimings.get(message.id);
+        if (timing) {
+          const totalMs = responseReceivedAt - timing.receivedAt;
+          const serverMs = timing.sentAt ? responseReceivedAt - timing.sentAt : totalMs;
+          log(`[BUG-003 Resp] Message ${message.id} (${timing.method}) response in ${totalMs}ms total (${serverMs}ms server)`);
+          messageTimings.delete(message.id);
+          if (totalMs > 3e4) {
+            log(`[BUG-003 Slow] Message ${message.id} took ${Math.round(totalMs / 1e3)}s - investigate!`);
+          }
+        }
+      }
       if (message.id !== void 0) {
         clearRequestTracking(message.id);
       }
@@ -20555,6 +20587,8 @@ function mcpProxy({
     serverTransport.onerror = onServerError;
   }
   transportToClient.onmessage = (_message) => {
+    const receivedAt = Date.now();
+    lastActivityTime = receivedAt;
     const message = messageTransformer.interceptRequest(_message);
     if (isMessageBlocked(message)) {
       return;
@@ -20575,6 +20609,10 @@ function mcpProxy({
         return;
       }
     }
+    if (message.id !== void 0) {
+      messageTimings.set(message.id, { receivedAt, method: message.method });
+      log(`[BUG-003 Recv] Message ${message.id} (${message.method}) received from client at ${new Date(receivedAt).toISOString()}`);
+    }
     log("[Local\u2192Remote]", message.method || message.id);
     debugLog("Local \u2192 Remote message", {
       method: message.method,
@@ -20590,6 +20628,9 @@ function mcpProxy({
       debugLog("Initialize message with modified client info", { clientInfo });
     }
     if (isReconnecting || !connectionHealthy) {
+      const timing = message.id !== void 0 ? messageTimings.get(message.id) : void 0;
+      const delayMs = timing ? Date.now() - timing.receivedAt : 0;
+      log(`[BUG-003 Queue] Message ${message.id || "(no id)"} (${message.method}) queued after ${delayMs}ms - connection unhealthy or reconnecting`);
       log("[Local\u2192Remote] (queuing during reconnect)", message.method || message.id);
       queueMessageForRetry(message);
       if (pendingMessages.length % 10 === 0) {
@@ -20598,7 +20639,23 @@ function mcpProxy({
       return;
     }
     trackRequest(message);
-    currentTransportToServer.send(message).catch((error2) => {
+    const sendStartTime = Date.now();
+    if (message.id !== void 0) {
+      const timing = messageTimings.get(message.id);
+      if (timing) {
+        timing.sentAt = sendStartTime;
+        const delayMs = sendStartTime - timing.receivedAt;
+        if (delayMs > 100) {
+          log(`[BUG-003 Delay] Message ${message.id} (${message.method}) took ${delayMs}ms from receive to send`);
+        }
+      }
+    }
+    currentTransportToServer.send(message).then(() => {
+      const sendDuration = Date.now() - sendStartTime;
+      if (sendDuration > 1e3) {
+        log(`[BUG-003 SendSlow] Message ${message.id || "(no id)"} (${message.method}) send() took ${sendDuration}ms`);
+      }
+    }).catch((error2) => {
       if (message.id !== void 0) {
         clearRequestTracking(message.id);
       }
@@ -20610,6 +20667,7 @@ function mcpProxy({
   };
   setupServerTransportHandlers(transportToServer);
   transportToClient.onclose = () => {
+    clearInterval(statusInterval);
     if (transportToServerClosed) {
       return;
     }
