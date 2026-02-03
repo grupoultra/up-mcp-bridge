@@ -12,7 +12,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-AQQRDKPJ.js";
+} from "./chunk-VCPCJEG4.js";
 
 // src/client.ts
 import { EventEmitter } from "events";

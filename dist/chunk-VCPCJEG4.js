@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.11";
+var version2 = "1.0.12";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20024,6 +20024,8 @@ var REASON_TRANSPORT_FALLBACK = "falling-back-to-alternate-transport";
 var PING_INTERVAL_MS = 1e3;
 var PING_TIMEOUT_MS = 2e3;
 var MAX_PING_FAILURES = 3;
+var BACKGROUND_HEARTBEAT_INTERVAL_MS = 1e4;
+var BACKGROUND_HEARTBEAT_MAX_FAILURES = 2;
 var MAX_SSE_ERRORS_BEFORE_RECONNECT = 2;
 var SSE_ERROR_PATTERNS = ["timeout", "terminated", "aborted", "network", "ECONNRESET", "ECONNREFUSED", "session not found"];
 async function pingServer(serverUrl, sessionId) {
@@ -20187,6 +20189,59 @@ function mcpProxy({
   let consecutiveTimeouts = 0;
   let consecutiveSseErrors = 0;
   const pendingRequests = /* @__PURE__ */ new Map();
+  let backgroundHeartbeatInterval;
+  let backgroundHeartbeatFailures = 0;
+  function startBackgroundHeartbeat() {
+    if (backgroundHeartbeatInterval) return;
+    if (!serverUrl) {
+      debugLog("[Heartbeat] No serverUrl, background heartbeat disabled");
+      return;
+    }
+    log("[Heartbeat] Starting background heartbeat");
+    backgroundHeartbeatInterval = setInterval(async () => {
+      if (isReconnecting || !connectionHealthy) {
+        return;
+      }
+      if (pendingRequests.size > 0) {
+        backgroundHeartbeatFailures = 0;
+        return;
+      }
+      debugLog("[Heartbeat] Checking connection health...");
+      const pingResult = await pingServer(serverUrl, currentSessionId);
+      if (pingResult.sessionExpired) {
+        log("[Heartbeat] Session expired (410 Gone), triggering reconnection");
+        backgroundHeartbeatFailures = 0;
+        stopBackgroundHeartbeat();
+        setConnectionHealthy(false, "heartbeat: session expired");
+        currentTransportToServer.close().catch(onServerError);
+        return;
+      }
+      if (pingResult.alive) {
+        if (backgroundHeartbeatFailures > 0) {
+          log(`[Heartbeat] Server recovered after ${backgroundHeartbeatFailures} failures`);
+        }
+        backgroundHeartbeatFailures = 0;
+      } else {
+        backgroundHeartbeatFailures++;
+        log(`[Heartbeat] Ping failed (${backgroundHeartbeatFailures}/${BACKGROUND_HEARTBEAT_MAX_FAILURES})`);
+        if (backgroundHeartbeatFailures >= BACKGROUND_HEARTBEAT_MAX_FAILURES) {
+          log("[Heartbeat] Connection appears dead, triggering reconnection");
+          backgroundHeartbeatFailures = 0;
+          stopBackgroundHeartbeat();
+          setConnectionHealthy(false, "heartbeat: max failures");
+          currentTransportToServer.close().catch(onServerError);
+        }
+      }
+    }, BACKGROUND_HEARTBEAT_INTERVAL_MS);
+  }
+  function stopBackgroundHeartbeat() {
+    if (backgroundHeartbeatInterval) {
+      clearInterval(backgroundHeartbeatInterval);
+      backgroundHeartbeatInterval = void 0;
+      backgroundHeartbeatFailures = 0;
+      debugLog("[Heartbeat] Background heartbeat stopped");
+    }
+  }
   let currentSessionId;
   let sessionIdExtracted = false;
   function tryExtractSessionId() {
@@ -20503,6 +20558,7 @@ function mcpProxy({
       if (transportToClientClosed) {
         return;
       }
+      stopBackgroundHeartbeat();
       clearAllRequestTracking();
       setConnectionHealthy(false, "remote transport closed");
       if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
@@ -20539,6 +20595,7 @@ function mcpProxy({
             setConnectionHealthy(true, "reconnection successful");
             consecutiveTimeouts = 0;
             consecutiveSseErrors = 0;
+            startBackgroundHeartbeat();
             sessionIdExtracted = false;
             currentSessionId = void 0;
             tryExtractSessionId();
@@ -20666,8 +20723,10 @@ function mcpProxy({
     });
   };
   setupServerTransportHandlers(transportToServer);
+  startBackgroundHeartbeat();
   transportToClient.onclose = () => {
     clearInterval(statusInterval);
+    stopBackgroundHeartbeat();
     if (transportToServerClosed) {
       return;
     }

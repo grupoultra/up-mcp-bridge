@@ -30,6 +30,10 @@ const PING_INTERVAL_MS = 1000 // Ping every 1 second while waiting for response
 const PING_TIMEOUT_MS = 2000 // Ping request timeout
 const MAX_PING_FAILURES = 3 // Number of consecutive ping failures before marking connection dead
 
+// Background heartbeat configuration (detects dead connections when idle)
+const BACKGROUND_HEARTBEAT_INTERVAL_MS = 10000 // Check every 10 seconds when idle
+const BACKGROUND_HEARTBEAT_MAX_FAILURES = 2 // Trigger reconnect after 2 consecutive failures
+
 // SSE error detection for reconnection
 const MAX_SSE_ERRORS_BEFORE_RECONNECT = 2 // Number of consecutive SSE errors before forcing reconnect
 const SSE_ERROR_PATTERNS = ['timeout', 'terminated', 'aborted', 'network', 'ECONNRESET', 'ECONNREFUSED', 'session not found']
@@ -296,6 +300,71 @@ export function mcpProxy({
   let consecutiveTimeouts = 0
   let consecutiveSseErrors = 0 // Track SSE-level errors (like body timeout)
   const pendingRequests = new Map<string | number, { timeout: NodeJS.Timeout; message: Message }>()
+
+  // Background heartbeat for detecting dead connections when idle
+  let backgroundHeartbeatInterval: NodeJS.Timeout | undefined
+  let backgroundHeartbeatFailures = 0
+
+  function startBackgroundHeartbeat() {
+    if (backgroundHeartbeatInterval) return // Already running
+    if (!serverUrl) {
+      debugLog('[Heartbeat] No serverUrl, background heartbeat disabled')
+      return
+    }
+
+    log('[Heartbeat] Starting background heartbeat')
+    backgroundHeartbeatInterval = setInterval(async () => {
+      // Skip if already reconnecting or connection is unhealthy
+      if (isReconnecting || !connectionHealthy) {
+        return
+      }
+
+      // Skip if there are active requests (they have their own ping)
+      if (pendingRequests.size > 0) {
+        backgroundHeartbeatFailures = 0 // Reset on activity
+        return
+      }
+
+      debugLog('[Heartbeat] Checking connection health...')
+      const pingResult = await pingServer(serverUrl!, currentSessionId)
+
+      if (pingResult.sessionExpired) {
+        log('[Heartbeat] Session expired (410 Gone), triggering reconnection')
+        backgroundHeartbeatFailures = 0
+        stopBackgroundHeartbeat()
+        setConnectionHealthy(false, 'heartbeat: session expired')
+        currentTransportToServer.close().catch(onServerError)
+        return
+      }
+
+      if (pingResult.alive) {
+        if (backgroundHeartbeatFailures > 0) {
+          log(`[Heartbeat] Server recovered after ${backgroundHeartbeatFailures} failures`)
+        }
+        backgroundHeartbeatFailures = 0
+      } else {
+        backgroundHeartbeatFailures++
+        log(`[Heartbeat] Ping failed (${backgroundHeartbeatFailures}/${BACKGROUND_HEARTBEAT_MAX_FAILURES})`)
+
+        if (backgroundHeartbeatFailures >= BACKGROUND_HEARTBEAT_MAX_FAILURES) {
+          log('[Heartbeat] Connection appears dead, triggering reconnection')
+          backgroundHeartbeatFailures = 0
+          stopBackgroundHeartbeat()
+          setConnectionHealthy(false, 'heartbeat: max failures')
+          currentTransportToServer.close().catch(onServerError)
+        }
+      }
+    }, BACKGROUND_HEARTBEAT_INTERVAL_MS)
+  }
+
+  function stopBackgroundHeartbeat() {
+    if (backgroundHeartbeatInterval) {
+      clearInterval(backgroundHeartbeatInterval)
+      backgroundHeartbeatInterval = undefined
+      backgroundHeartbeatFailures = 0
+      debugLog('[Heartbeat] Background heartbeat stopped')
+    }
+  }
 
   // Session ID for session-aware ping (extracted from SSE transport after connection is established)
   let currentSessionId: string | undefined
@@ -709,6 +778,9 @@ export function mcpProxy({
         return
       }
 
+      // Stop background heartbeat since connection is closed
+      stopBackgroundHeartbeat()
+
       // Clear all pending request timeouts since we're reconnecting
       clearAllRequestTracking()
       setConnectionHealthy(false, 'remote transport closed')
@@ -767,6 +839,9 @@ export function mcpProxy({
             setConnectionHealthy(true, 'reconnection successful')
             consecutiveTimeouts = 0 // Reset timeout counter on successful reconnect
             consecutiveSseErrors = 0 // Reset SSE error counter on successful reconnect
+
+            // Restart background heartbeat for new connection
+            startBackgroundHeartbeat()
 
             // Reset sessionId extraction flag for new transport
             sessionIdExtracted = false
@@ -945,9 +1020,15 @@ export function mcpProxy({
   // Set up handlers for the initial server transport
   setupServerTransportHandlers(transportToServer)
 
+  // Start background heartbeat for idle connection health monitoring
+  startBackgroundHeartbeat()
+
   transportToClient.onclose = () => {
     // BUG-003: Cleanup status interval
     clearInterval(statusInterval)
+
+    // Stop background heartbeat
+    stopBackgroundHeartbeat()
 
     if (transportToServerClosed) {
       return
