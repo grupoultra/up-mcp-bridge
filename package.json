@@ -1,6 +1,6 @@
 {
   "name": "up-mcp-bridge",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "description": "Remote proxy for MCP with auto-reconnect support. Fork of mcp-remote with transparent server restart handling.",
   "keywords": [
     "mcp",

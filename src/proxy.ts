@@ -11,11 +11,41 @@
 
 import { EventEmitter } from 'events'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { connectToRemoteServer, log, debugLog, mcpProxy, parseCommandLineArgs, setupSignalHandlers, TransportStrategy, ReconnectOptions } from './lib/utils'
+import { connectToRemoteServer, log, debugLog, mcpProxy, parseCommandLineArgs, setupSignalHandlers, TransportStrategy, ReconnectOptions, MCP_REMOTE_VERSION } from './lib/utils'
 import { StaticOAuthClientInformationFull, StaticOAuthClientMetadata } from './lib/types'
 import { NodeOAuthClientProvider } from './lib/node-oauth-client-provider'
 import { createLazyAuthCoordinator } from './lib/coordination'
 import { fetchAuthorizationServerMetadata } from './lib/authorization-server-metadata'
+
+// Handle --version and --help before parsing other arguments
+const args = process.argv.slice(2)
+if (args.includes('--version') || args.includes('-v')) {
+  console.log(`up-mcp-bridge v${MCP_REMOTE_VERSION}`)
+  process.exit(0)
+}
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`up-mcp-bridge v${MCP_REMOTE_VERSION}
+
+Usage: npx up-mcp-bridge <server-url> [options]
+
+Options:
+  --version, -v              Show version number
+  --help, -h                 Show this help message
+  --debug                    Enable debug logging
+  --auto-reconnect           Enable automatic reconnection
+  --max-reconnect-attempts N Maximum reconnection attempts (default: 20)
+  --reconnect-delay N        Base delay between attempts in ms (default: 1000)
+  --max-reconnect-delay N    Maximum delay between attempts in ms (default: 15000)
+  --connection-timeout N     Connection timeout in ms (default: 5000)
+  --transport STRATEGY       Transport strategy: sse-only, http-only, sse-first, http-first
+  --header "Key: Value"      Add custom header (can be repeated)
+  --timeout N                Request timeout in ms (default: 60000)
+
+Example:
+  npx up-mcp-bridge http://localhost:3000/sse --auto-reconnect
+`)
+  process.exit(0)
+}
 
 /**
  * Main function to run the proxy

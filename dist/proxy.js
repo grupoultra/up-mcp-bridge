@@ -9,8 +9,9 @@ import {
   log,
   mcpProxy,
   parseCommandLineArgs,
-  setupSignalHandlers
-} from "./chunk-W6GV7FR5.js";
+  setupSignalHandlers,
+  version
+} from "./chunk-CHT4ICHM.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
@@ -111,6 +112,34 @@ var StdioServerTransport = class {
 };
 
 // src/proxy.ts
+var args = process.argv.slice(2);
+if (args.includes("--version") || args.includes("-v")) {
+  console.log(`up-mcp-bridge v${version}`);
+  process.exit(0);
+}
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`up-mcp-bridge v${version}
+
+Usage: npx up-mcp-bridge <server-url> [options]
+
+Options:
+  --version, -v              Show version number
+  --help, -h                 Show this help message
+  --debug                    Enable debug logging
+  --auto-reconnect           Enable automatic reconnection
+  --max-reconnect-attempts N Maximum reconnection attempts (default: 20)
+  --reconnect-delay N        Base delay between attempts in ms (default: 1000)
+  --max-reconnect-delay N    Maximum delay between attempts in ms (default: 15000)
+  --connection-timeout N     Connection timeout in ms (default: 5000)
+  --transport STRATEGY       Transport strategy: sse-only, http-only, sse-first, http-first
+  --header "Key: Value"      Add custom header (can be repeated)
+  --timeout N                Request timeout in ms (default: 60000)
+
+Example:
+  npx up-mcp-bridge http://localhost:3000/sse --auto-reconnect
+`);
+  process.exit(0);
+}
 async function runProxy(serverUrl, callbackPort, headers, transportStrategy = "http-first", host, staticOAuthClientMetadata, staticOAuthClientInfo, authorizeResource, ignoredTools, authTimeoutMs, serverUrlHash, reconnectOptions) {
   const events = new EventEmitter();
   const authCoordinator = createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTimeoutMs);
