@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.15";
+var version2 = "1.0.16";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
