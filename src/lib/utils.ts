@@ -773,6 +773,31 @@ export function mcpProxy({
         error: message.error,
       })
 
+      // BUG-005: Detect -32600 "Session not initialized" error and trigger re-initialization
+      // This happens when the server rejects requests because the MCP handshake wasn't completed
+      // (e.g., after context compaction where Claude sends tool calls without re-initializing)
+      if (message.error?.code === -32600 &&
+          message.error.message?.includes('Session not initialized')) {
+        log('[BUG-005] Received -32600 "Session not initialized" error from server')
+
+        if (mcpSessionInitialized) {
+          log('[BUG-005] Bridge thought session was initialized - resetting state')
+          mcpSessionInitialized = false
+        }
+
+        // Trigger re-initialization in background (don't await - let error flow to client)
+        log('[BUG-005] Triggering proactive re-initialization...')
+        reinitializeMcpSession(serverTransport).then((success) => {
+          if (success) {
+            log('[BUG-005] Proactive re-initialization successful! Next request should work.')
+          } else {
+            log('[BUG-005] Proactive re-initialization failed - may need full reconnection')
+          }
+        }).catch((err) => {
+          log('[BUG-005] Error during proactive re-initialization:', err)
+        })
+      }
+
       transportToClient.send(message).then(() => {
         log(`[Forward] Response ${message.id || message.method} forwarded to client`)
       }).catch((error) => {

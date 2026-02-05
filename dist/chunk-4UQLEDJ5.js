@@ -20551,6 +20551,23 @@ function mcpProxy({
         result: message.result ? "result-present" : void 0,
         error: message.error
       });
+      if (message.error?.code === -32600 && message.error.message?.includes("Session not initialized")) {
+        log('[BUG-005] Received -32600 "Session not initialized" error from server');
+        if (mcpSessionInitialized) {
+          log("[BUG-005] Bridge thought session was initialized - resetting state");
+          mcpSessionInitialized = false;
+        }
+        log("[BUG-005] Triggering proactive re-initialization...");
+        reinitializeMcpSession(serverTransport).then((success) => {
+          if (success) {
+            log("[BUG-005] Proactive re-initialization successful! Next request should work.");
+          } else {
+            log("[BUG-005] Proactive re-initialization failed - may need full reconnection");
+          }
+        }).catch((err) => {
+          log("[BUG-005] Error during proactive re-initialization:", err);
+        });
+      }
       transportToClient.send(message).then(() => {
         log(`[Forward] Response ${message.id || message.method} forwarded to client`);
       }).catch((error2) => {
