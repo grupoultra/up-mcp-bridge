@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.12";
+var version2 = "1.0.13";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20161,6 +20161,7 @@ function mcpProxy({
   let isReconnecting = false;
   let reconnectAttempts = 0;
   let connectionHealthy = true;
+  let mcpSessionInitialized = false;
   const pendingMessages = [];
   const messageTimings = /* @__PURE__ */ new Map();
   let lastActivityTime = Date.now();
@@ -20526,6 +20527,9 @@ function mcpProxy({
       const message = messageTransformer.interceptResponse(_message);
       log("[Remote\u2192Local]", message.method || message.id);
       tryExtractSessionId();
+      if (message.result && message.result.serverInfo) {
+        log("[MCP Init] Received initialize response, session will be marked initialized after notifications/initialized is sent");
+      }
       if (message.id !== void 0) {
         const timing = messageTimings.get(message.id);
         if (timing) {
@@ -20561,6 +20565,8 @@ function mcpProxy({
       stopBackgroundHeartbeat();
       clearAllRequestTracking();
       setConnectionHealthy(false, "remote transport closed");
+      mcpSessionInitialized = false;
+      log("[MCP Init] Session initialization reset for reconnection");
       if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
         log(`Remote transport closed. Starting reconnection loop...`);
         debugLog("Remote transport closed, starting reconnection loop", { attempt: reconnectAttempts + 1 });
@@ -20590,6 +20596,8 @@ function mcpProxy({
               });
               continue;
             }
+            mcpSessionInitialized = true;
+            log("[MCP Init] Session re-initialized successfully after reconnection");
             reconnectAttempts = 0;
             isReconnecting = false;
             setConnectionHealthy(true, "reconnection successful");
@@ -20682,7 +20690,12 @@ function mcpProxy({
       log(JSON.stringify(message, null, 2));
       savedInitializeMessage = { ...message };
       log("[Init] Saved initialize message for potential reconnection");
+      mcpSessionInitialized = false;
+      log("[MCP Init] Starting new MCP handshake, session marked as not initialized");
       debugLog("Initialize message with modified client info", { clientInfo });
+    }
+    if (message.method === "notifications/initialized") {
+      log("[MCP Init] Client sending notifications/initialized, marking session as initialized");
     }
     if (isReconnecting || !connectionHealthy) {
       const timing = message.id !== void 0 ? messageTimings.get(message.id) : void 0;
@@ -20692,6 +20705,15 @@ function mcpProxy({
       queueMessageForRetry(message);
       if (pendingMessages.length % 10 === 0) {
         log(`Warning: ${pendingMessages.length} messages queued waiting for reconnection`);
+      }
+      return;
+    }
+    if (!mcpSessionInitialized && message.method !== "initialize" && message.method !== "notifications/initialized") {
+      log(`[BUG-005] Session not initialized, queuing message ${message.id || "(no id)"} (${message.method})`);
+      log("[Local\u2192Remote] (queuing - session not initialized)", message.method || message.id);
+      queueMessageForRetry(message);
+      if (pendingMessages.length === 1) {
+        log("[BUG-005] Hint: This usually happens after context compaction. Messages will be sent after session is re-initialized.");
       }
       return;
     }
@@ -20711,6 +20733,31 @@ function mcpProxy({
       const sendDuration = Date.now() - sendStartTime;
       if (sendDuration > 1e3) {
         log(`[BUG-003 SendSlow] Message ${message.id || "(no id)"} (${message.method}) send() took ${sendDuration}ms`);
+      }
+      if (message.method === "notifications/initialized" && !mcpSessionInitialized) {
+        mcpSessionInitialized = true;
+        log("[MCP Init] Session initialized! Flushing any queued messages...");
+        const queueSize = pendingMessages.length;
+        if (queueSize > 0) {
+          log(`[MCP Init] Flushing ${queueSize} queued messages that were waiting for session initialization`);
+          let flushedCount = 0;
+          while (pendingMessages.length > 0) {
+            const pending = pendingMessages.shift();
+            if (pending.message.id) {
+              queuedMessageIds.delete(pending.message.id);
+            }
+            if (Date.now() - pending.timestamp < messageTimeoutMs) {
+              log(`[MCP Init] Sending queued message ${pending.message.id || "(no id)"} (${pending.message.method})`);
+              trackRequest(pending.message);
+              currentTransportToServer.send(pending.message).catch(onServerError);
+              flushedCount++;
+            } else {
+              log(`[MCP Init] Message ${pending.message.id} expired, sending error`);
+              sendErrorForPendingMessage(pending, "Request timed out waiting for MCP session initialization");
+            }
+          }
+          log(`[MCP Init] Flush complete: ${flushedCount} messages sent`);
+        }
       }
     }).catch((error2) => {
       if (message.id !== void 0) {

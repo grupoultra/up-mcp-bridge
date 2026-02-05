@@ -264,6 +264,7 @@ export function mcpProxy({
   let isReconnecting = false
   let reconnectAttempts = 0
   let connectionHealthy = true
+  let mcpSessionInitialized = false // BUG-005: Track MCP handshake completion
   const pendingMessages: { message: Message; timestamp: number }[] = []
 
   // BUG-003: Track message timing for diagnosis
@@ -737,6 +738,13 @@ export function mcpProxy({
       // Try to extract sessionId on first message (when _endpoint should be populated)
       tryExtractSessionId()
 
+      // BUG-005: Track MCP session initialization
+      // When we receive the initialize response (result with serverInfo/capabilities), mark session as initialized
+      if (message.result && message.result.serverInfo) {
+        log('[MCP Init] Received initialize response, session will be marked initialized after notifications/initialized is sent')
+        // Note: We'll mark as initialized when client sends notifications/initialized
+      }
+
       // BUG-003: Log response timing
       if (message.id !== undefined) {
         const timing = messageTimings.get(message.id)
@@ -785,6 +793,10 @@ export function mcpProxy({
       clearAllRequestTracking()
       setConnectionHealthy(false, 'remote transport closed')
 
+      // BUG-005: Reset session initialization state for reconnection
+      mcpSessionInitialized = false
+      log('[MCP Init] Session initialization reset for reconnection')
+
       // Check if auto-reconnect is enabled
       if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
         log(`Remote transport closed. Starting reconnection loop...`)
@@ -832,6 +844,10 @@ export function mcpProxy({
               newTransport.close().catch(() => {})
               continue // Try next reconnection attempt
             }
+
+            // BUG-005: Mark session as initialized after successful reinitializeMcpSession
+            mcpSessionInitialized = true
+            log('[MCP Init] Session re-initialized successfully after reconnection')
 
             // Reset state
             reconnectAttempts = 0
@@ -964,7 +980,17 @@ export function mcpProxy({
       savedInitializeMessage = { ...message }
       log('[Init] Saved initialize message for potential reconnection')
 
+      // BUG-005: Reset session initialized flag - we're starting a new handshake
+      mcpSessionInitialized = false
+      log('[MCP Init] Starting new MCP handshake, session marked as not initialized')
+
       debugLog('Initialize message with modified client info', { clientInfo })
+    }
+
+    // BUG-005: Track when notifications/initialized is sent - this completes the handshake
+    if (message.method === 'notifications/initialized') {
+      log('[MCP Init] Client sending notifications/initialized, marking session as initialized')
+      // We'll mark as initialized after successfully sending to server
     }
 
     // If reconnecting or connection is unhealthy, queue the message
@@ -978,6 +1004,20 @@ export function mcpProxy({
       // Warn if queue is getting large
       if (pendingMessages.length % 10 === 0) {
         log(`Warning: ${pendingMessages.length} messages queued waiting for reconnection`)
+      }
+      return
+    }
+
+    // BUG-005: If MCP session not initialized and this is not an initialize message, queue it
+    // This handles the case after context compaction where Claude sends tool calls without re-initializing
+    if (!mcpSessionInitialized && message.method !== 'initialize' && message.method !== 'notifications/initialized') {
+      log(`[BUG-005] Session not initialized, queuing message ${message.id || '(no id)'} (${message.method})`)
+      log('[Local→Remote] (queuing - session not initialized)', message.method || message.id)
+      queueMessageForRetry(message)
+
+      // Warn user about the situation
+      if (pendingMessages.length === 1) {
+        log('[BUG-005] Hint: This usually happens after context compaction. Messages will be sent after session is re-initialized.')
       }
       return
     }
@@ -1002,6 +1042,36 @@ export function mcpProxy({
       const sendDuration = Date.now() - sendStartTime
       if (sendDuration > 1000) {
         log(`[BUG-003 SendSlow] Message ${message.id || '(no id)'} (${message.method}) send() took ${sendDuration}ms`)
+      }
+
+      // BUG-005: Mark session as initialized after successfully sending notifications/initialized
+      if (message.method === 'notifications/initialized' && !mcpSessionInitialized) {
+        mcpSessionInitialized = true
+        log('[MCP Init] Session initialized! Flushing any queued messages...')
+
+        // Flush any messages that were queued waiting for initialization
+        const queueSize = pendingMessages.length
+        if (queueSize > 0) {
+          log(`[MCP Init] Flushing ${queueSize} queued messages that were waiting for session initialization`)
+          let flushedCount = 0
+          while (pendingMessages.length > 0) {
+            const pending = pendingMessages.shift()!
+            if (pending.message.id) {
+              queuedMessageIds.delete(pending.message.id)
+            }
+            // Check if message hasn't expired
+            if (Date.now() - pending.timestamp < messageTimeoutMs) {
+              log(`[MCP Init] Sending queued message ${pending.message.id || '(no id)'} (${pending.message.method})`)
+              trackRequest(pending.message)
+              currentTransportToServer.send(pending.message).catch(onServerError)
+              flushedCount++
+            } else {
+              log(`[MCP Init] Message ${pending.message.id} expired, sending error`)
+              sendErrorForPendingMessage(pending, 'Request timed out waiting for MCP session initialization')
+            }
+          }
+          log(`[MCP Init] Flush complete: ${flushedCount} messages sent`)
+        }
       }
     }).catch((error) => {
       // Clear the timeout since send failed
