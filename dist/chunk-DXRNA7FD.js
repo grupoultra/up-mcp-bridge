@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.16";
+var version2 = "1.0.17";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20560,7 +20560,29 @@ function mcpProxy({
         log("[BUG-005] Triggering proactive re-initialization...");
         reinitializeMcpSession(serverTransport).then((success) => {
           if (success) {
-            log("[BUG-005] Proactive re-initialization successful! Next request should work.");
+            mcpSessionInitialized = true;
+            log("[BUG-005] Proactive re-initialization successful! Session marked as initialized.");
+            const queueSize = pendingMessages.length;
+            if (queueSize > 0) {
+              log(`[BUG-005] Flushing ${queueSize} queued messages after re-initialization`);
+              let flushedCount = 0;
+              while (pendingMessages.length > 0) {
+                const pending = pendingMessages.shift();
+                if (pending.message.id) {
+                  queuedMessageIds.delete(pending.message.id);
+                }
+                if (Date.now() - pending.timestamp < messageTimeoutMs) {
+                  log(`[BUG-005] Sending queued message ${pending.message.id || "(no id)"} (${pending.message.method})`);
+                  trackRequest(pending.message);
+                  currentTransportToServer.send(pending.message).catch(onServerError);
+                  flushedCount++;
+                } else {
+                  log(`[BUG-005] Message ${pending.message.id} expired during re-initialization wait`);
+                  sendErrorForPendingMessage(pending, "Request timed out waiting for MCP session re-initialization");
+                }
+              }
+              log(`[BUG-005] Flush complete: ${flushedCount} messages sent`);
+            }
           } else {
             log("[BUG-005] Proactive re-initialization failed - may need full reconnection");
           }

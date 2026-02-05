@@ -11,7 +11,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-KD2GULUK.js";
+} from "./chunk-DXRNA7FD.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
