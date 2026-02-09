@@ -265,6 +265,18 @@ export function mcpProxy({
   let reconnectAttempts = 0
   let connectionHealthy = true
   let mcpSessionInitialized = false // BUG-005: Track MCP handshake completion
+  // BUG-005: Methods that are part of the MCP handshake and must pass through even before
+  // the session is confirmed. Operational messages (tools/call etc.) are queued until
+  // the gateway confirms the session by responding successfully to one of these.
+  const HANDSHAKE_METHODS = new Set([
+    'initialize',
+    'notifications/initialized',
+    'tools/list',
+    'resources/list',
+    'prompts/list',
+    'resources/templates/list',
+    'ping',
+  ])
   const pendingMessages: { message: Message; timestamp: number }[] = []
 
   // BUG-003: Track message timing for diagnosis
@@ -739,10 +751,43 @@ export function mcpProxy({
       tryExtractSessionId()
 
       // BUG-005: Track MCP session initialization
-      // When we receive the initialize response (result with serverInfo/capabilities), mark session as initialized
+      // The initialize response (with serverInfo) means the server accepted the handshake,
+      // but we still need to wait for notifications/initialized to be processed.
       if (message.result && message.result.serverInfo) {
-        log('[MCP Init] Received initialize response, session will be marked initialized after notifications/initialized is sent')
-        // Note: We'll mark as initialized when client sends notifications/initialized
+        log('[MCP Init] Received initialize response from server')
+      }
+
+      // BUG-005 fix: Confirm session is initialized when we receive the first successful
+      // response to a request sent AFTER notifications/initialized. This proves the gateway
+      // has processed the notification and transitioned to STATE_INITIALIZED.
+      // A successful response (has id, no error) to tools/list, resources/list, etc.
+      // is the natural confirmation signal.
+      if (!mcpSessionInitialized && message.id !== undefined && !message.error && !message.result?.serverInfo) {
+        mcpSessionInitialized = true
+        log(`[MCP Init] Session CONFIRMED initialized (successful response to request ${message.id})`)
+
+        // Flush queued operational messages (tools/call, etc.)
+        const queueSize = pendingMessages.length
+        if (queueSize > 0) {
+          log(`[MCP Init] Flushing ${queueSize} queued messages after session confirmation`)
+          let flushedCount = 0
+          while (pendingMessages.length > 0) {
+            const pending = pendingMessages.shift()!
+            if (pending.message.id) {
+              queuedMessageIds.delete(pending.message.id)
+            }
+            if (Date.now() - pending.timestamp < messageTimeoutMs) {
+              log(`[MCP Init] Sending queued message ${pending.message.id || '(no id)'} (${pending.message.method})`)
+              trackRequest(pending.message)
+              currentTransportToServer.send(pending.message).catch(onServerError)
+              flushedCount++
+            } else {
+              log(`[MCP Init] Message ${pending.message.id} expired, sending error`)
+              sendErrorForPendingMessage(pending, 'Request timed out waiting for MCP session confirmation')
+            }
+          }
+          log(`[MCP Init] Flush complete: ${flushedCount} messages sent`)
+        }
       }
 
       // BUG-003: Log response timing
@@ -1037,10 +1082,10 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    // BUG-005: Track when notifications/initialized is sent - this completes the handshake
+    // BUG-005: Track when notifications/initialized is sent
     if (message.method === 'notifications/initialized') {
-      log('[MCP Init] Client sending notifications/initialized, marking session as initialized')
-      // We'll mark as initialized after successfully sending to server
+      log('[MCP Init] Client sending notifications/initialized')
+      // Session will be confirmed when we receive the first successful response from server
     }
 
     // If reconnecting or connection is unhealthy, queue the message
@@ -1058,16 +1103,16 @@ export function mcpProxy({
       return
     }
 
-    // BUG-005: If MCP session not initialized and this is not an initialize message, queue it
-    // This handles the case after context compaction where Claude sends tool calls without re-initializing
-    if (!mcpSessionInitialized && message.method !== 'initialize' && message.method !== 'notifications/initialized') {
+    // BUG-005: If MCP session not initialized, only allow handshake-related messages through.
+    // Operational messages (tools/call, resources/read, etc.) are queued until the gateway
+    // confirms the session is ready by responding successfully to a post-handshake request.
+    if (!mcpSessionInitialized && !HANDSHAKE_METHODS.has(message.method)) {
       log(`[BUG-005] Session not initialized, queuing message ${message.id || '(no id)'} (${message.method})`)
       log('[Local→Remote] (queuing - session not initialized)', message.method || message.id)
       queueMessageForRetry(message)
 
-      // Warn user about the situation
       if (pendingMessages.length === 1) {
-        log('[BUG-005] Hint: This usually happens after context compaction. Messages will be sent after session is re-initialized.')
+        log('[BUG-005] Messages will be sent after server confirms session is initialized.')
       }
       return
     }
@@ -1094,33 +1139,17 @@ export function mcpProxy({
         log(`[BUG-003 SendSlow] Message ${message.id || '(no id)'} (${message.method}) send() took ${sendDuration}ms`)
       }
 
-      // BUG-005: Mark session as initialized after successfully sending notifications/initialized
-      if (message.method === 'notifications/initialized' && !mcpSessionInitialized) {
-        mcpSessionInitialized = true
-        log('[MCP Init] Session initialized! Flushing any queued messages...')
-
-        // Flush any messages that were queued waiting for initialization
+      // BUG-005: Don't mark session as initialized here. The send() promise resolves when
+      // the HTTP POST leaves the wire, NOT when the gateway has processed it. If we flush
+      // queued tool calls now, they may arrive at the gateway before notifications/initialized
+      // is processed, causing -32600 "Session not initialized" errors.
+      // Instead, we wait for the first successful server response (e.g., tools/list) which
+      // proves the gateway has completed the state transition to STATE_INITIALIZED.
+      if (message.method === 'notifications/initialized') {
+        log('[MCP Init] notifications/initialized sent to server, awaiting confirmation via first successful response...')
         const queueSize = pendingMessages.length
         if (queueSize > 0) {
-          log(`[MCP Init] Flushing ${queueSize} queued messages that were waiting for session initialization`)
-          let flushedCount = 0
-          while (pendingMessages.length > 0) {
-            const pending = pendingMessages.shift()!
-            if (pending.message.id) {
-              queuedMessageIds.delete(pending.message.id)
-            }
-            // Check if message hasn't expired
-            if (Date.now() - pending.timestamp < messageTimeoutMs) {
-              log(`[MCP Init] Sending queued message ${pending.message.id || '(no id)'} (${pending.message.method})`)
-              trackRequest(pending.message)
-              currentTransportToServer.send(pending.message).catch(onServerError)
-              flushedCount++
-            } else {
-              log(`[MCP Init] Message ${pending.message.id} expired, sending error`)
-              sendErrorForPendingMessage(pending, 'Request timed out waiting for MCP session initialization')
-            }
-          }
-          log(`[MCP Init] Flush complete: ${flushedCount} messages sent`)
+          log(`[MCP Init] ${queueSize} messages queued, will flush after server confirms session`)
         }
       }
     }).catch((error) => {
