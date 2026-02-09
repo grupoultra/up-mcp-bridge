@@ -11,7 +11,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-ELLAENVK.js";
+} from "./chunk-VBXGFME6.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";

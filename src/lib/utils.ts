@@ -142,9 +142,9 @@ function initLogFile() {
 
   try {
     if (CLEAR_LOG_ON_START) {
-      fs.writeFileSync(LOG_FILE_PATH, `=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
+      fs.writeFileSync(LOG_FILE_PATH, `=== mcp-remote v${MCP_REMOTE_VERSION} started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
     } else {
-      fs.appendFileSync(LOG_FILE_PATH, `\n=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
+      fs.appendFileSync(LOG_FILE_PATH, `\n=== mcp-remote v${MCP_REMOTE_VERSION} started at ${getTimestamp()} (pid: ${pid}) ===\n`, { encoding: 'utf8' })
     }
   } catch (error) {
     console.error(`[LOG FILE ERROR] Could not initialize ${LOG_FILE_PATH}: ${error}`)
@@ -383,15 +383,26 @@ export function mcpProxy({
   let currentSessionId: string | undefined
   let sessionIdExtracted = false
 
-  // Helper to extract sessionId (called after first message received, when _endpoint is populated)
-  function tryExtractSessionId() {
-    if (sessionIdExtracted) return
+  // Helper to extract sessionId (called after messages, when _endpoint is populated)
+  // BUG-005: Always compare instead of early-returning, to detect internal SSE reconnections
+  function tryExtractSessionId(): { changed: boolean; oldSessionId?: string; newSessionId?: string } {
     const sessionId = extractSessionId(currentTransportToServer)
-    if (sessionId) {
+    if (!sessionId) return { changed: false }
+
+    if (currentSessionId && sessionId !== currentSessionId) {
+      const oldId = currentSessionId
       currentSessionId = sessionId
       sessionIdExtracted = true
+      log(`[BUG-005] Session ID changed: ${oldId} → ${sessionId}`)
+      return { changed: true, oldSessionId: oldId, newSessionId: sessionId }
+    }
+
+    if (!sessionIdExtracted) {
       log(`[Session] Extracted sessionId from transport: ${sessionId}`)
     }
+    currentSessionId = sessionId
+    sessionIdExtracted = true
+    return { changed: false }
   }
 
   // Store the original initialize message to re-send after reconnection
@@ -1103,6 +1114,57 @@ export function mcpProxy({
       return
     }
 
+    // BUG-005: Detect if SSEClientTransport internally reconnected (e.g., after Body Timeout).
+    // EventSource reconnects silently, creating a new session in the gateway, but the bridge
+    // still thinks the old session is valid. Compare transport's current sessionId with stored one.
+    const sessionCheck = tryExtractSessionId()
+    if (sessionCheck.changed) {
+      log(`[BUG-005] SSE transport internally reconnected! Session: ${sessionCheck.oldSessionId} → ${sessionCheck.newSessionId}`)
+      mcpSessionInitialized = false
+
+      // Queue this message (it will be flushed after reinit)
+      log(`[BUG-005] Queuing message ${message.id || '(no id)'} (${message.method}) pending re-initialization`)
+      queueMessageForRetry(message)
+
+      // Re-initialize MCP session in background
+      log('[BUG-005] Triggering MCP re-initialization for new session...')
+      reinitializeMcpSession(currentTransportToServer).then((success) => {
+        if (success) {
+          mcpSessionInitialized = true
+          log('[BUG-005] Re-initialization successful after internal SSE reconnection!')
+
+          // Flush queued messages
+          const queueSize = pendingMessages.length
+          if (queueSize > 0) {
+            log(`[BUG-005] Flushing ${queueSize} queued messages after re-initialization`)
+            let flushedCount = 0
+            while (pendingMessages.length > 0) {
+              const pending = pendingMessages.shift()!
+              if (pending.message.id) {
+                queuedMessageIds.delete(pending.message.id)
+              }
+              if (Date.now() - pending.timestamp < messageTimeoutMs) {
+                log(`[BUG-005] Sending queued message ${pending.message.id || '(no id)'} (${pending.message.method})`)
+                trackRequest(pending.message)
+                currentTransportToServer.send(pending.message).catch(onServerError)
+                flushedCount++
+              } else {
+                log(`[BUG-005] Message ${pending.message.id} expired during re-initialization`)
+                sendErrorForPendingMessage(pending, 'Request timed out waiting for MCP session re-initialization')
+              }
+            }
+            log(`[BUG-005] Flush complete: ${flushedCount} messages sent`)
+          }
+        } else {
+          log('[BUG-005] Re-initialization failed after internal SSE reconnection - may need full reconnect')
+        }
+      }).catch((err) => {
+        log('[BUG-005] Error during re-initialization after internal SSE reconnection:', err)
+      })
+
+      return // Message is queued, will be sent after reinit
+    }
+
     // BUG-005: If MCP session not initialized, only allow handshake-related messages through.
     // Operational messages (tools/call, resources/read, etc.) are queued until the gateway
     // confirms the session is ready by responding successfully to a post-handshake request.
@@ -1206,6 +1268,15 @@ export function mcpProxy({
     if (isConnectionError) {
       consecutiveSseErrors++
       log(`[SSE Error] Connection error detected (${consecutiveSseErrors}/${MAX_SSE_ERRORS_BEFORE_RECONNECT}): ${errorStr.substring(0, 100)}`)
+
+      // BUG-005: Immediately reset session state on SSE connection errors.
+      // After a Body Timeout, EventSource will reconnect creating a new session.
+      // By resetting now, any tool calls arriving before Change #1 detects the
+      // session change will be safely queued instead of forwarded to a dead session.
+      if (mcpSessionInitialized) {
+        mcpSessionInitialized = false
+        log('[BUG-005] Session state reset due to SSE connection error')
+      }
 
       if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
         log('[SSE Error] Max consecutive SSE errors reached, forcing reconnection...')

@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.19";
+var version2 = "1.0.20";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20078,11 +20078,11 @@ function initLogFile() {
   logFileInitialized = true;
   try {
     if (CLEAR_LOG_ON_START) {
-      fs2.writeFileSync(LOG_FILE_PATH, `=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===
+      fs2.writeFileSync(LOG_FILE_PATH, `=== mcp-remote v${version2} started at ${getTimestamp()} (pid: ${pid}) ===
 `, { encoding: "utf8" });
     } else {
       fs2.appendFileSync(LOG_FILE_PATH, `
-=== mcp-remote started at ${getTimestamp()} (pid: ${pid}) ===
+=== mcp-remote v${version2} started at ${getTimestamp()} (pid: ${pid}) ===
 `, { encoding: "utf8" });
     }
   } catch (error2) {
@@ -20255,13 +20255,21 @@ function mcpProxy({
   let currentSessionId;
   let sessionIdExtracted = false;
   function tryExtractSessionId() {
-    if (sessionIdExtracted) return;
     const sessionId = extractSessionId(currentTransportToServer);
-    if (sessionId) {
+    if (!sessionId) return { changed: false };
+    if (currentSessionId && sessionId !== currentSessionId) {
+      const oldId = currentSessionId;
       currentSessionId = sessionId;
       sessionIdExtracted = true;
+      log(`[BUG-005] Session ID changed: ${oldId} \u2192 ${sessionId}`);
+      return { changed: true, oldSessionId: oldId, newSessionId: sessionId };
+    }
+    if (!sessionIdExtracted) {
       log(`[Session] Extracted sessionId from transport: ${sessionId}`);
     }
+    currentSessionId = sessionId;
+    sessionIdExtracted = true;
+    return { changed: false };
   }
   let savedInitializeMessage = null;
   let initializeIdCounter = 1e6;
@@ -20781,6 +20789,46 @@ function mcpProxy({
       }
       return;
     }
+    const sessionCheck = tryExtractSessionId();
+    if (sessionCheck.changed) {
+      log(`[BUG-005] SSE transport internally reconnected! Session: ${sessionCheck.oldSessionId} \u2192 ${sessionCheck.newSessionId}`);
+      mcpSessionInitialized = false;
+      log(`[BUG-005] Queuing message ${message.id || "(no id)"} (${message.method}) pending re-initialization`);
+      queueMessageForRetry(message);
+      log("[BUG-005] Triggering MCP re-initialization for new session...");
+      reinitializeMcpSession(currentTransportToServer).then((success) => {
+        if (success) {
+          mcpSessionInitialized = true;
+          log("[BUG-005] Re-initialization successful after internal SSE reconnection!");
+          const queueSize = pendingMessages.length;
+          if (queueSize > 0) {
+            log(`[BUG-005] Flushing ${queueSize} queued messages after re-initialization`);
+            let flushedCount = 0;
+            while (pendingMessages.length > 0) {
+              const pending = pendingMessages.shift();
+              if (pending.message.id) {
+                queuedMessageIds.delete(pending.message.id);
+              }
+              if (Date.now() - pending.timestamp < messageTimeoutMs) {
+                log(`[BUG-005] Sending queued message ${pending.message.id || "(no id)"} (${pending.message.method})`);
+                trackRequest(pending.message);
+                currentTransportToServer.send(pending.message).catch(onServerError);
+                flushedCount++;
+              } else {
+                log(`[BUG-005] Message ${pending.message.id} expired during re-initialization`);
+                sendErrorForPendingMessage(pending, "Request timed out waiting for MCP session re-initialization");
+              }
+            }
+            log(`[BUG-005] Flush complete: ${flushedCount} messages sent`);
+          }
+        } else {
+          log("[BUG-005] Re-initialization failed after internal SSE reconnection - may need full reconnect");
+        }
+      }).catch((err) => {
+        log("[BUG-005] Error during re-initialization after internal SSE reconnection:", err);
+      });
+      return;
+    }
     if (!mcpSessionInitialized && !HANDSHAKE_METHODS.has(message.method)) {
       log(`[BUG-005] Session not initialized, queuing message ${message.id || "(no id)"} (${message.method})`);
       log("[Local\u2192Remote] (queuing - session not initialized)", message.method || message.id);
@@ -20849,6 +20897,10 @@ function mcpProxy({
     if (isConnectionError) {
       consecutiveSseErrors++;
       log(`[SSE Error] Connection error detected (${consecutiveSseErrors}/${MAX_SSE_ERRORS_BEFORE_RECONNECT}): ${errorStr.substring(0, 100)}`);
+      if (mcpSessionInitialized) {
+        mcpSessionInitialized = false;
+        log("[BUG-005] Session state reset due to SSE connection error");
+      }
       if (consecutiveSseErrors >= MAX_SSE_ERRORS_BEFORE_RECONNECT && !isReconnecting) {
         log("[SSE Error] Max consecutive SSE errors reached, forcing reconnection...");
         consecutiveSseErrors = 0;
