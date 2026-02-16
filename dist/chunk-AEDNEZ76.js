@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.20";
+var version2 = "1.0.21";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20160,6 +20160,7 @@ function mcpProxy({
   let currentTransportToServer = transportToServer;
   let isReconnecting = false;
   let reconnectAttempts = 0;
+  let inPersistentRetry = false;
   let connectionHealthy = true;
   let mcpSessionInitialized = false;
   const HANDSHAKE_METHODS = /* @__PURE__ */ new Set([
@@ -20193,6 +20194,7 @@ function mcpProxy({
   const queuedMessageIds = /* @__PURE__ */ new Set();
   const maxDelayMs = reconnectOptions.maxDelayMs ?? 15e3;
   const connectionTimeoutMs = reconnectOptions.connectionTimeoutMs ?? 5e3;
+  const persistentRetryDelayMs = reconnectOptions.persistentRetryDelayMs ?? 3e4;
   const messageTimeoutMs = 6e4;
   const requestTimeoutMs = 5e3;
   const maxConsecutiveTimeouts = 3;
@@ -20648,14 +20650,32 @@ function mcpProxy({
       setConnectionHealthy(false, "remote transport closed");
       mcpSessionInitialized = false;
       log("[MCP Init] Session initialization reset for reconnection");
-      if (reconnectOptions.enabled && reconnectFn && reconnectAttempts < reconnectOptions.maxAttempts) {
+      if (reconnectOptions.enabled && reconnectFn) {
         log(`Remote transport closed. Starting reconnection loop...`);
         debugLog("Remote transport closed, starting reconnection loop", { attempt: reconnectAttempts + 1 });
         isReconnecting = true;
-        while (reconnectAttempts < reconnectOptions.maxAttempts && !transportToClientClosed) {
+        while (!transportToClientClosed) {
           reconnectAttempts++;
-          const delay = Math.min(reconnectOptions.baseDelayMs * Math.pow(2, reconnectAttempts - 1), maxDelayMs);
-          log(`Reconnect attempt ${reconnectAttempts}/${reconnectOptions.maxAttempts} - waiting ${delay}ms...`);
+          if (!inPersistentRetry && reconnectAttempts > reconnectOptions.maxAttempts) {
+            inPersistentRetry = true;
+            log(`[Persistent] Entering persistent retry mode after ${reconnectOptions.maxAttempts} fast attempts. Will retry every ${persistentRetryDelayMs / 1e3}s indefinitely until gateway recovers.`);
+          }
+          let delay;
+          let logThisAttempt;
+          if (inPersistentRetry) {
+            delay = persistentRetryDelayMs;
+            logThisAttempt = reconnectAttempts % 10 === 0;
+          } else {
+            delay = Math.min(reconnectOptions.baseDelayMs * Math.pow(2, reconnectAttempts - 1), maxDelayMs);
+            logThisAttempt = true;
+          }
+          if (logThisAttempt) {
+            if (inPersistentRetry) {
+              log(`[Persistent] Attempt ${reconnectAttempts} (persistent mode) - waiting ${delay / 1e3}s...`);
+            } else {
+              log(`Reconnect attempt ${reconnectAttempts}/${reconnectOptions.maxAttempts} - waiting ${delay}ms...`);
+            }
+          }
           await new Promise((resolve) => setTimeout(resolve, delay));
           flushExpiredMessages();
           try {
@@ -20679,7 +20699,11 @@ function mcpProxy({
             }
             mcpSessionInitialized = true;
             log("[MCP Init] Session re-initialized successfully after reconnection");
+            if (inPersistentRetry) {
+              log(`[Persistent] Gateway recovered after ${reconnectAttempts} total attempts!`);
+            }
             reconnectAttempts = 0;
+            inPersistentRetry = false;
             isReconnecting = false;
             setConnectionHealthy(true, "reconnection successful");
             consecutiveTimeouts = 0;
@@ -20715,13 +20739,13 @@ function mcpProxy({
             debugLog("Reconnection attempt failed", { error: error2, attempts: reconnectAttempts });
           }
         }
-        log(`Max reconnect attempts (${reconnectOptions.maxAttempts}) reached. Closing connection.`);
-        debugLog("Max reconnect attempts reached", { attempts: reconnectAttempts });
-        flushAllPendingMessagesWithError("Server connection lost and reconnection failed");
+        log(`Reconnection loop ended: client disconnected after ${reconnectAttempts} attempts.`);
+        debugLog("Reconnection loop ended, client disconnected", { attempts: reconnectAttempts });
+        flushAllPendingMessagesWithError("Client disconnected during reconnection");
         transportToServerClosed = true;
         isReconnecting = false;
-        setConnectionHealthy(false, "max reconnect attempts reached");
-        transportToClient.close().catch(onClientError);
+        inPersistentRetry = false;
+        setConnectionHealthy(false, "client disconnected during reconnection");
       } else {
         transportToServerClosed = true;
         setConnectionHealthy(false, "remote transport closed (no auto-reconnect)");
@@ -21283,15 +21307,27 @@ async function parseCommandLineArgs(args, usage) {
       log(`Warning: Ignoring invalid --connection-timeout value: ${args[connectionTimeoutIndex + 1]}. Must be a positive number.`);
     }
   }
+  let persistentRetryDelayMs = 3e4;
+  const persistentRetryDelayIndex = args.indexOf("--persistent-retry-delay");
+  if (persistentRetryDelayIndex !== -1 && persistentRetryDelayIndex < args.length - 1) {
+    const value = parseInt(args[persistentRetryDelayIndex + 1], 10);
+    if (!isNaN(value) && value > 0) {
+      persistentRetryDelayMs = value;
+      log(`Using persistent retry delay: ${persistentRetryDelayMs}ms`);
+    } else {
+      log(`Warning: Ignoring invalid --persistent-retry-delay value: ${args[persistentRetryDelayIndex + 1]}. Must be a positive number.`);
+    }
+  }
   const reconnectOptions = {
     enabled: autoReconnect,
     maxAttempts: maxReconnectAttempts,
     baseDelayMs: reconnectDelayMs,
     maxDelayMs: maxReconnectDelayMs,
-    connectionTimeoutMs
+    connectionTimeoutMs,
+    persistentRetryDelayMs
   };
   if (autoReconnect) {
-    log(`Auto-reconnect enabled: max ${maxReconnectAttempts} attempts, base delay ${reconnectDelayMs}ms, max delay ${maxReconnectDelayMs}ms, timeout ${connectionTimeoutMs}ms`);
+    log(`Auto-reconnect enabled: fast phase: ${maxReconnectAttempts} attempts (${reconnectDelayMs}ms\u2192${maxReconnectDelayMs}ms backoff), persistent phase: every ${persistentRetryDelayMs / 1e3}s indefinitely`);
   }
   if (!serverUrl) {
     log(usage);
