@@ -37,6 +37,7 @@ Options:
   --reconnect-delay N          Base delay between fast attempts in ms (default: 1000)
   --max-reconnect-delay N      Maximum delay in fast phase in ms (default: 15000)
   --persistent-retry-delay N   Fixed delay in persistent phase in ms (default: 30000)
+  --max-reconnect-duration N   Max time in persistent phase before self-destruct in ms (default: 300000)
   --connection-timeout N       Connection timeout in ms (default: 5000)
   --transport STRATEGY         Transport strategy: sse-only, http-only, sse-first, http-first
   --header "Key: Value"        Add custom header (can be repeated)
@@ -44,8 +45,10 @@ Options:
 
 Reconnection behavior (two-phase):
   Fast phase:       Attempts 1-N with exponential backoff (1s→2s→4s→...→15s)
-  Persistent phase: After N attempts, retries every 30s indefinitely until
-                    the gateway recovers or the client disconnects.
+  Persistent phase: After N attempts, retries every 30s for up to 5 minutes
+                    (configurable via --max-reconnect-duration). If the gateway
+                    doesn't recover, the bridge exits so the MCP client can
+                    spawn a fresh process that connects cleanly.
 
 Example:
   npx up-mcp-bridge http://localhost:3000/sse --auto-reconnect
@@ -154,7 +157,7 @@ async function runProxy(
     log('Local STDIO server running')
     log(`Proxy established successfully between local STDIO and remote ${remoteTransport.constructor.name}`)
     if (reconnectOptions.enabled) {
-      log(`Auto-reconnect enabled (fast: ${reconnectOptions.maxAttempts} attempts, persistent: every ${(reconnectOptions.persistentRetryDelayMs ?? 30000) / 1000}s, never gives up)`)
+      log(`Auto-reconnect enabled (fast: ${reconnectOptions.maxAttempts} attempts, persistent: every ${(reconnectOptions.persistentRetryDelayMs ?? 30000) / 1000}s, max duration: ${(reconnectOptions.maxReconnectDurationMs ?? 300000) / 1000}s)`)
     }
     log('Press Ctrl+C to exit')
 

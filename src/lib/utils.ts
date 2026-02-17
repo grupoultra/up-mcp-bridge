@@ -118,6 +118,7 @@ export interface ReconnectOptions {
   maxDelayMs?: number // Maximum delay between attempts (default: 15000)
   connectionTimeoutMs?: number // Timeout for each connection attempt (default: 5000)
   persistentRetryDelayMs?: number // Fixed delay for persistent retry phase (default: 30000)
+  maxReconnectDurationMs?: number // BUG-006: Max time in persistent mode before self-destruct (default: 300000 = 5min)
 }
 export { MCP_REMOTE_VERSION }
 
@@ -310,6 +311,7 @@ export function mcpProxy({
   const maxDelayMs = reconnectOptions.maxDelayMs ?? 15000
   const connectionTimeoutMs = reconnectOptions.connectionTimeoutMs ?? 5000
   const persistentRetryDelayMs = reconnectOptions.persistentRetryDelayMs ?? 30000
+  const maxReconnectDurationMs = reconnectOptions.maxReconnectDurationMs ?? 300000 // BUG-006: 5 min default
   const messageTimeoutMs = 60000 // Messages older than 60s will get error response
   const requestTimeoutMs = 5000 // If no response in 5s, assume connection is dead (reasonable for local gateway)
   const maxConsecutiveTimeouts = 3 // Exit process after this many consecutive timeouts
@@ -913,14 +915,28 @@ export function mcpProxy({
 
         isReconnecting = true
 
-        // Two-phase reconnection loop: fast (exponential backoff) then persistent (fixed delay, infinite)
+        // Two-phase reconnection loop: fast (exponential backoff) then persistent (fixed delay, with max duration)
+        let persistentStartTime: number | undefined
         while (!transportToClientClosed) {
           reconnectAttempts++
 
           // Phase transition: after maxAttempts, switch to persistent retry mode
           if (!inPersistentRetry && reconnectAttempts > reconnectOptions.maxAttempts) {
             inPersistentRetry = true
-            log(`[Persistent] Entering persistent retry mode after ${reconnectOptions.maxAttempts} fast attempts. Will retry every ${persistentRetryDelayMs / 1000}s indefinitely until gateway recovers.`)
+            persistentStartTime = Date.now()
+            log(`[Persistent] Entering persistent retry mode after ${reconnectOptions.maxAttempts} fast attempts. Will retry every ${persistentRetryDelayMs / 1000}s for up to ${maxReconnectDurationMs / 1000}s before self-destruct.`)
+          }
+
+          // BUG-006: Self-destruct if persistent mode has exceeded max duration.
+          // A fresh bridge process (spawned by Claude Code/Desktop) always connects cleanly.
+          if (inPersistentRetry && persistentStartTime &&
+              Date.now() - persistentStartTime > maxReconnectDurationMs) {
+            const elapsedSec = Math.round((Date.now() - persistentStartTime) / 1000)
+            log(`[BUG-006 Self-destruct] Reconnection failed for ${elapsedSec}s (limit: ${maxReconnectDurationMs / 1000}s). Exiting process for clean restart.`)
+            flushAllPendingMessagesWithError('Bridge self-destructing after prolonged reconnection failure')
+            clearInterval(statusInterval)
+            stopBackgroundHeartbeat()
+            process.exit(1)
           }
 
           let delay: number
@@ -1032,8 +1048,11 @@ export function mcpProxy({
 
             return // Successfully reconnected, exit the loop
           } catch (error) {
-            log(`Reconnection attempt ${reconnectAttempts} failed:`, error)
-            debugLog('Reconnection attempt failed', { error, attempts: reconnectAttempts })
+            // BUG-006: Extract HTTP error code for better diagnosis
+            const errorCode = (error as any)?.code || (error as any)?.event?.code || 'unknown'
+            const errorStr = String(error).substring(0, 200)
+            log(`Reconnection attempt ${reconnectAttempts} failed (HTTP ${errorCode}): ${errorStr}`)
+            debugLog('Reconnection attempt failed', { error, errorCode, attempts: reconnectAttempts, serverUrl })
             // Continue to next iteration
           }
         }
@@ -1870,6 +1889,19 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     }
   }
 
+  // BUG-006: Max duration for persistent reconnection before self-destruct
+  let maxReconnectDurationMs = 300000 // Default 5 minutes
+  const maxReconnectDurationIndex = args.indexOf('--max-reconnect-duration')
+  if (maxReconnectDurationIndex !== -1 && maxReconnectDurationIndex < args.length - 1) {
+    const value = parseInt(args[maxReconnectDurationIndex + 1], 10)
+    if (!isNaN(value) && value > 0) {
+      maxReconnectDurationMs = value
+      log(`Using max reconnect duration: ${maxReconnectDurationMs}ms (${maxReconnectDurationMs / 1000}s)`)
+    } else {
+      log(`Warning: Ignoring invalid --max-reconnect-duration value: ${args[maxReconnectDurationIndex + 1]}. Must be a positive number.`)
+    }
+  }
+
   const reconnectOptions: ReconnectOptions = {
     enabled: autoReconnect,
     maxAttempts: maxReconnectAttempts,
@@ -1877,10 +1909,11 @@ export async function parseCommandLineArgs(args: string[], usage: string) {
     maxDelayMs: maxReconnectDelayMs,
     connectionTimeoutMs: connectionTimeoutMs,
     persistentRetryDelayMs: persistentRetryDelayMs,
+    maxReconnectDurationMs: maxReconnectDurationMs,
   }
 
   if (autoReconnect) {
-    log(`Auto-reconnect enabled: fast phase: ${maxReconnectAttempts} attempts (${reconnectDelayMs}ms→${maxReconnectDelayMs}ms backoff), persistent phase: every ${persistentRetryDelayMs / 1000}s indefinitely`)
+    log(`Auto-reconnect enabled: fast phase: ${maxReconnectAttempts} attempts (${reconnectDelayMs}ms→${maxReconnectDelayMs}ms backoff), persistent phase: every ${persistentRetryDelayMs / 1000}s for up to ${maxReconnectDurationMs / 1000}s`)
   }
 
   if (!serverUrl) {
