@@ -18043,7 +18043,7 @@ var Client = class extends Protocol {
 };
 
 // package.json
-var version2 = "1.0.21";
+var version2 = "1.0.23";
 
 // node_modules/pkce-challenge/dist/index.node.js
 var crypto;
@@ -20163,13 +20163,9 @@ function mcpProxy({
   let inPersistentRetry = false;
   let connectionHealthy = true;
   let mcpSessionInitialized = false;
-  const HANDSHAKE_METHODS = /* @__PURE__ */ new Set([
+  const PRE_INIT_METHODS = /* @__PURE__ */ new Set([
     "initialize",
     "notifications/initialized",
-    "tools/list",
-    "resources/list",
-    "prompts/list",
-    "resources/templates/list",
     "ping"
   ]);
   const pendingMessages = [];
@@ -20866,12 +20862,12 @@ function mcpProxy({
       });
       return;
     }
-    if (!mcpSessionInitialized && !HANDSHAKE_METHODS.has(message.method)) {
+    if (!mcpSessionInitialized && !PRE_INIT_METHODS.has(message.method)) {
       log(`[BUG-005] Session not initialized, queuing message ${message.id || "(no id)"} (${message.method})`);
       log("[Local\u2192Remote] (queuing - session not initialized)", message.method || message.id);
       queueMessageForRetry(message);
       if (pendingMessages.length === 1) {
-        log("[BUG-005] Messages will be sent after server confirms session is initialized.");
+        log("[BUG-005] Messages will be sent after notifications/initialized confirms session.");
       }
       return;
     }
@@ -20893,10 +20889,28 @@ function mcpProxy({
         log(`[BUG-003 SendSlow] Message ${message.id || "(no id)"} (${message.method}) send() took ${sendDuration}ms`);
       }
       if (message.method === "notifications/initialized") {
-        log("[MCP Init] notifications/initialized sent to server, awaiting confirmation via first successful response...");
+        mcpSessionInitialized = true;
+        log("[MCP Init] notifications/initialized sent to server, session marked as initialized");
         const queueSize = pendingMessages.length;
         if (queueSize > 0) {
-          log(`[MCP Init] ${queueSize} messages queued, will flush after server confirms session`);
+          log(`[MCP Init] Flushing ${queueSize} queued messages after session confirmed`);
+          let flushedCount = 0;
+          while (pendingMessages.length > 0) {
+            const pending = pendingMessages.shift();
+            if (pending.message.id) {
+              queuedMessageIds.delete(pending.message.id);
+            }
+            if (Date.now() - pending.timestamp < messageTimeoutMs) {
+              log(`[MCP Init] Sending queued message ${pending.message.id || "(no id)"} (${pending.message.method})`);
+              trackRequest(pending.message);
+              currentTransportToServer.send(pending.message).catch(onServerError);
+              flushedCount++;
+            } else {
+              log(`[MCP Init] Message ${pending.message.id} expired during init wait`);
+              sendErrorForPendingMessage(pending, "Request timed out waiting for MCP session initialization");
+            }
+          }
+          log(`[MCP Init] Flush complete: ${flushedCount} messages sent`);
         }
       }
     }).catch((error2) => {

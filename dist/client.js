@@ -12,7 +12,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-MGPO7ENV.js";
+} from "./chunk-LBPBMZHR.js";
 
 // src/client.ts
 import { EventEmitter } from "events";

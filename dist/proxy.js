@@ -11,7 +11,7 @@ import {
   parseCommandLineArgs,
   setupSignalHandlers,
   version
-} from "./chunk-MGPO7ENV.js";
+} from "./chunk-LBPBMZHR.js";
 
 // src/proxy.ts
 import { EventEmitter } from "events";
